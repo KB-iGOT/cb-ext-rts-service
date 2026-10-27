@@ -1,0 +1,13 @@
+package com.igot.cb;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
+
+@SpringBootApplication
+@ConfigurationPropertiesScan
+public class WebSocketPocApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(WebSocketPocApplication.class, args);
+    }
+}
