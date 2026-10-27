@@ -6,7 +6,7 @@ echo "Docker build script"
 set -eo pipefail
 
 build_tag=$1
-name=cb-ext-userprofile-service
+name=cb-ext-rts-service
 node=$2
 org=$3
 
