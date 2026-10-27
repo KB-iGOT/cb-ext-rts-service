@@ -30,7 +30,7 @@ node() {
             sh '''
 	
 	    docker build -f ./Dockerfile.build -t $docker_pre_build .
-	    docker run --name $docker_pre_build $docker_pre_build:latest && docker cp $docker_pre_build:/opt/target/cb-ext-rts-service-1.0.0.jar .
+	    docker run --name $docker_pre_build $docker_pre_build:latest && docker cp $docker_pre_build:/opt/target/cb-ext-rts-service.jar .
 	    sleep 1
 	    docker rm -f $docker_pre_build
 	    docker rmi -f $docker_pre_build
