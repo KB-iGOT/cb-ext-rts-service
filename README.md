@@ -1,9 +1,6 @@
 # cb-ext-rts-service
 
-Real Time Survey (RTS) WebSocket server that keeps **everything in one pod's memory (no Redis)**. Its job is to
-measure how many sockets and how much survey traffic **one pod** can carry, so the technology and the pod size can
-be decided. It speaks the same protocol as the HLD (§9) and `rts-realtime-service`, so the same load tools drive both.
-
+A Real Time Survey (RTS) lets a Program Coordinator ask the learners in a classroom (offline) session of a Blended Program a few quick questions and see their answers as they come in. Learners answer from their phone or laptop. The coordinator decides when each question appears, when answering stops, and when results and the correct answer are shown. After the session, the coordinator and the MDO can see a report.
 Java 17 · Spring Boot 3.4 · WebFlux on Reactor Netty.
 
 ## What it does
@@ -26,46 +23,6 @@ Identity comes from the URL (no auth, this is a capacity tool):
 `ws://host:8080/ws?rtsCode=482913&userId=asha&role=PARTICIPANT|COORDINATOR&name=Asha`.
 The old `?room=&clientId=&role=trainer|learner` form still works for `scripts/poc_test.py` and
 `scripts/pod_load_test.py` (plain `QUESTION` relay + a `{"type":"CONNECTED","pod":...}` hello).
-
-## Build, test, run
-
-```bash
-mvn clean package                      # runs SurveyFlowTest (whole survey over real sockets)
-POD_NAME=local-1 PORT=8081 java -jar target/cb-ext-rts-service.jar
-```
-
-`POD_NAME` is only a label for logs and `/stats` (default `local-1`). In Kubernetes it is set from the pod name.
-
-## Measuring one pod
-
-| Endpoint | What |
-|---|---|
-| `GET /stats` | sockets (open, peak), surveys by status, frames in/out per second, CPU cores used, heap/direct memory, **KB per connection**, fan-out time p50/p95/p99, GC, drops |
-| `POST /stats/gc` | full GC, then `/stats` (clean KB-per-connection figure) |
-| `GET /actuator/prometheus` | the same as `rts_*` metrics plus JVM metrics, for Grafana |
-| log | one `STATS ...` line every 10 s |
-
-Load comes from the load generator in `~/IdeaProjects/rts-realtime-service` (same protocol; dashboard + API,
-resizable while running). `scripts/capacity_ramp.py` steps it up and writes one CSV row per step:
-
-```bash
-# terminal 1: pod-sized server (1 core, 1.5 GB heap)
-POD_NAME=pod-1cpu PORT=8083 taskset -c 0 java -Xmx1500m -jar target/cb-ext-rts-service.jar
-# terminal 2: load generator (separate JVM)
-cd ~/IdeaProjects/rts-realtime-service && java -Xmx4g -jar target/rts-realtime-service.jar --spring.profiles.active=loadgen
-# terminal 3: ramp
-python3 scripts/capacity_ramp.py --server http://localhost:8083 --loadgen http://localhost:7017 \
-    --ws-url ws://localhost:8083/ws --start 20 --step 40 --max 130 --cpu-limit 1
-```
-
-A step fails when: connect failures > 0.5 %, any socket dropped, push → learner p95 > 500 ms, CPU > 80 % of the
-limit, heap > 85 %, or a slow client was dropped. One load generator on one IP opens about 28k sockets to one
-address; locally that is the ceiling, in Kubernetes use `k8s/rts-loadgen.yaml` (wider port range, more replicas).
-
-## Kubernetes
-
-`k8s/cb-ext-rts-service.yaml` (1 replica, requests = limits = 1 CPU / 2 Gi, `POD_NAME` from the pod name) and
-`k8s/rts-loadgen.yaml` (load generator inside the cluster). See the steps in the conversation notes / team page.
 
 ## Files
 
