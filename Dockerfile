@@ -14,7 +14,7 @@ RUN apt-get update && \
         xz-utils && \
     rm -rf /var/lib/apt/lists/*
 
-COPY cb-ext-rts-service-1.0.0.jar /opt/
+COPY cb-ext-rts-service.jar /opt/
 
 RUN chown -R appuser:appuser /opt
 
@@ -22,4 +22,4 @@ USER appuser
 
 WORKDIR /opt
 
-CMD ["/bin/bash", "-c", "java -XX:+PrintFlagsFinal $JAVA_OPTIONS -XX:+UnlockExperimentalVMOptions -jar /opt/cb-ext-rts-service-1.0.0.jar"]
+CMD ["/bin/bash", "-c", "java -XX:+PrintFlagsFinal $JAVA_OPTIONS -XX:+UnlockExperimentalVMOptions -jar /opt/cb-ext-rts-service.jar"]
