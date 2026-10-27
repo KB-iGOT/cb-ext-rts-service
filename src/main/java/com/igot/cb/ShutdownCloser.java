@@ -1,4 +1,4 @@
-package com.example.wspoc;
+package com.igot.cb;
 
 import org.springframework.context.SmartLifecycle;
 import org.springframework.stereotype.Component;

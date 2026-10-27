@@ -1,10 +1,10 @@
-package com.example.wspoc;
+package com.igot.cb;
 
-import static com.example.wspoc.Frames.map;
+import static com.igot.cb.Frames.map;
 
-import com.example.wspoc.Session.Push;
-import com.example.wspoc.Session.Status;
-import com.example.wspoc.Session.Target;
+import com.igot.cb.Session.Push;
+import com.igot.cb.Session.Status;
+import com.igot.cb.Session.Target;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PreDestroy;

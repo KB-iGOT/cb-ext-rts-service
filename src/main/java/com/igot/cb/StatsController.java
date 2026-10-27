@@ -1,4 +1,4 @@
-package com.example.wspoc;
+package com.igot.cb;
 
 import java.util.Map;
 import org.springframework.web.bind.annotation.GetMapping;

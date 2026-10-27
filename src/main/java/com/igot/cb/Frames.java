@@ -1,4 +1,4 @@
-package com.example.wspoc;
+package com.igot.cb;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;

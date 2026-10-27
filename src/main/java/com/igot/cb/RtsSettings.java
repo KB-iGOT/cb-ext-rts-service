@@ -1,4 +1,4 @@
-package com.example.wspoc;
+package com.igot.cb;
 
 import java.time.Duration;
 import org.springframework.boot.context.properties.ConfigurationProperties;

@@ -1,4 +1,4 @@
-package com.example.wspoc;
+package com.igot.cb;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import java.util.ArrayList;

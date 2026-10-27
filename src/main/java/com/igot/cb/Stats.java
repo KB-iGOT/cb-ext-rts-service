@@ -1,4 +1,4 @@
-package com.example.wspoc;
+package com.igot.cb;
 
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;

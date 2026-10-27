@@ -1,4 +1,4 @@
-package com.example.wspoc;
+package com.igot.cb;
 
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;

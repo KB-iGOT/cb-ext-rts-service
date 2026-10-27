@@ -1,4 +1,4 @@
-package com.example.wspoc;
+package com.igot.cb;
 
 import org.springframework.web.reactive.socket.CloseStatus;
 import org.springframework.web.reactive.socket.WebSocketMessage;
