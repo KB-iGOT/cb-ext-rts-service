@@ -38,6 +38,11 @@ class SurveyFlowTest {
 
         Client ravi = connect("S1", "ravi", "PARTICIPANT");
         assertEquals("LIVE", ravi.next("SESSION_STATE").at("/data/status").asText());
+        JsonNode joined = pc.next("PARTICIPANT_JOINED");
+        assertEquals("ravi", joined.at("/data/userId").asText());
+        assertEquals("ravi", joined.at("/data/name").asText());
+        assertTrue(joined.at("/data/pod").isTextual(), "PC is told which pod the learner joined");
+        assertEquals(2, joined.at("/data/connected").asInt());
         Client third = connect("S1", "third", "PARTICIPANT");
         assertEquals("PARTICIPANT_LIMIT_REACHED", third.next("ERROR").at("/error/code").asText());
 
