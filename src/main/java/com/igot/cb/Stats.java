@@ -50,6 +50,7 @@ public class Stats {
     private final Timer fanout;
 
     private final String pod;
+    private final boolean logEnabled;
     private final long startedAt = System.currentTimeMillis();
     private volatile Supplier<Map<String, Object>> sessions = Map::of;
     private volatile Map<String, Object> rates = Map.of();
@@ -63,6 +64,7 @@ public class Stats {
 
     public Stats(MeterRegistry registry, RtsSettings settings, @Value("${pod.name}") String pod) {
         this.pod = pod;
+        this.logEnabled = settings.stats().logEnabled();
         this.fanout = Timer.builder("rts.fanout")
                 .description("Time to queue one broadcast frame to every socket of a survey on this pod")
                 .publishPercentiles(0.5, 0.95, 0.99).publishPercentileHistogram().register(registry);
@@ -144,6 +146,9 @@ public class Stats {
             tickAt = now;
             prevCpuNanos = cpu;
             prevGcMs = gc;
+            if (!logEnabled) {
+                return;
+            }
             MemoryUsage heap = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
             log.info("STATS pod={} conns={} peak={} sessions={} in/s={} out/s={} answers/s={} cpuCores={} "
                     + "heapMb={}/{} directMb={} fanoutP99ms={} slowDropped={} idleClosed={}",

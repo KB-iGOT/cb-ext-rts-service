@@ -16,6 +16,7 @@ public record RtsSettings(Ws ws, Room room, Stats stats) {
             Duration deliveryReportDelay, int maxTextChars, boolean startOnPcJoin) {
     }
 
-    public record Stats(Duration logInterval) {
+    /** logInterval: window for the per-second rates in /stats. logEnabled: also print a STATS line each window. */
+    public record Stats(Duration logInterval, boolean logEnabled) {
     }
 }
