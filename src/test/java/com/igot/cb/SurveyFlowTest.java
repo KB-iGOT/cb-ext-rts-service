@@ -46,7 +46,7 @@ class SurveyFlowTest {
         assertEquals("ravi", joined.at("/data/name").asText());
         assertTrue(joined.at("/data/pod").isTextual(), "PC is told which pod the learner joined");
         assertEquals(2, joined.at("/data/connected").asInt());
-        Client third = connect("S1", "third", "PARTICIPANT");
+        Client third = connect(run + "S1", "third", "PARTICIPANT");
         assertEquals("PARTICIPANT_LIMIT_REACHED", third.next("ERROR").at("/error/code").asText());
 
         pc.send("PUSH_QUESTION", Map.of("question", Map.of("questionId", "Q1", "type", "SINGLE", "text", "Pick",

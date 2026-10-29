@@ -88,8 +88,8 @@ public class RtsWebSocketHandler implements WebSocketHandler {
         stats.connected(c.coordinator);
         boolean logIt = c.legacy || ws.logConnections();
         if (logIt) {
-            log.info("CONNECT pod={} client={} name={} role={} room={} sessionId={}", pod, userId, name, role, code,
-                    session.getId());
+            log.info("CONNECT pod={} client={} name={} role={} room={} sessionId={}", pod, c.userId, c.name, role,
+                    c.code, session.getId());
         }
 
         AtomicReference<CloseStatus> closeStatus = new AtomicReference<>();
