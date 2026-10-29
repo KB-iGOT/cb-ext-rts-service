@@ -128,7 +128,43 @@ public class SessionManager {
     Mono<Void> onJoined(Conn c) {
         if (c.legacy) {
             c.send(frames.raw(map("type", "CONNECTED", "pod", pod)));
-            return Mono.empty();
+            return;
+        }
+        boolean back = false;
+        boolean created = false;
+        byte[] state;
+        byte[] joined = null;
+        synchronized (s) {
+            if (c.coordinator && s.status == Status.PAUSED) {
+                s.status = Status.LIVE;
+                s.pausedAt = 0;
+                back = true;
+            } else if (c.coordinator && room.startOnPcJoin() && !s.running()) {
+                created = createRoom(s, c);
+            }
+            Push p = s.running() ? s.current : null;
+            String myAnswer = p != null && !c.coordinator && p.answered.contains(c.userId) ? "RECORDED" : null;
+            state = frames.event("SESSION_STATE", s.roomId, map("status", s.status,
+                    "role", c.coordinator ? "COORDINATOR" : "PARTICIPANT", "roomId", s.roomId, "pod", pod,
+                    "connected", s.participantCount(),
+                    "currentPush", p == null ? null : c.coordinator ? p.forCoordinator() : p.forLearners(),
+                    "myAnswer", myAnswer == null ? null : map("status", myAnswer)));
+            if (!c.coordinator && s.running()) {
+                joined = frames.event("PARTICIPANT_JOINED", s.roomId, map("userId", c.userId, "name", c.name,
+                        "pod", pod, "connected", s.participantCount()));
+            }
+        }
+        c.send(state);
+        if (joined != null) {
+            broadcast(s, Target.COORDINATORS, joined);
+        }
+        if (created) {
+            log.info("Survey {} started as room {} when PC {} joined", s.code, s.roomId, c.userId);
+            broadcast(s, Target.PARTICIPANTS, frames.event("SESSION_STARTED", s.roomId, map("roomId", s.roomId)));
+        }
+        if (back) {
+            log.info("Coordinator {} back in {}", c.userId, c.code);
+            broadcast(s, Target.PARTICIPANTS, frames.event("COORDINATOR_BACK", s.roomId, map()));
         }
         String code = c.code;
         if (c.coordinator) {
