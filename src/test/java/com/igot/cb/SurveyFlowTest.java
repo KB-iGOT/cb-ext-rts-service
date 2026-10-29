@@ -16,8 +16,11 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 
 /** The whole survey over real sockets: wait, start, push, answer, stop, results, reveal, PC drop, end. */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {"rts.room.pc-wait-timeout=2s", "rts.room.max-participants=2", "rts.room.start-on-pc-join=false"})
+        properties = {"rts.store=memory", "rts.room.pc-wait-timeout=2s", "rts.room.max-participants=2", "rts.room.start-on-pc-join=false"})
 class SurveyFlowTest {
+
+    /** Unique per test run: the Redis store keeps keys between runs. */
+    final String run = "T" + java.util.UUID.randomUUID().toString().substring(0, 6) + "-";
 
     @LocalServerPort
     int port;
@@ -27,23 +30,23 @@ class SurveyFlowTest {
 
     @Test
     void fullSurvey() throws Exception {
-        Client asha = connect("S1", "asha", "PARTICIPANT");
+        Client asha = connect(run + "S1", "asha", "PARTICIPANT");
         assertEquals("WAITING", asha.next("SESSION_STATE").at("/data/status").asText());
 
-        Client pc = connect("S1", "meena", "COORDINATOR");
+        Client pc = connect(run + "S1", "meena", "COORDINATOR");
         pc.next("SESSION_STATE");
         pc.send("START_SESSION", Map.of());
         assertTrue(pc.next("START_SESSION_RESULT").at("/data/created").asBoolean());
         asha.next("SESSION_STARTED");
 
-        Client ravi = connect("S1", "ravi", "PARTICIPANT");
+        Client ravi = connect(run + "S1", "ravi", "PARTICIPANT");
         assertEquals("LIVE", ravi.next("SESSION_STATE").at("/data/status").asText());
         JsonNode joined = pc.next("PARTICIPANT_JOINED");
         assertEquals("ravi", joined.at("/data/userId").asText());
         assertEquals("ravi", joined.at("/data/name").asText());
         assertTrue(joined.at("/data/pod").isTextual(), "PC is told which pod the learner joined");
         assertEquals(2, joined.at("/data/connected").asInt());
-        Client third = connect("S1", "third", "PARTICIPANT");
+        Client third = connect(run + "S1", "third", "PARTICIPANT");
         assertEquals("PARTICIPANT_LIMIT_REACHED", third.next("ERROR").at("/error/code").asText());
 
         pc.send("PUSH_QUESTION", Map.of("question", Map.of("questionId", "Q1", "type", "SINGLE", "text", "Pick",
@@ -81,14 +84,14 @@ class SurveyFlowTest {
         // a reconnecting learner sees the question and that they already answered
         asha.close();
         pc.next("PARTICIPANT_LEFT");
-        Client asha2 = connect("S1", "asha", "PARTICIPANT");
+        Client asha2 = connect(run + "S1", "asha", "PARTICIPANT");
         JsonNode state = asha2.next("SESSION_STATE");
         assertEquals("RECORDED", state.at("/data/myAnswer/status").asText());
 
         // PC network loss pauses; reconnect resumes
         pc.close();
         asha2.next("COORDINATOR_AWAY");
-        Client pc2 = connect("S1", "meena", "COORDINATOR");
+        Client pc2 = connect(run + "S1", "meena", "COORDINATOR");
         assertEquals("LIVE", pc2.next("SESSION_STATE").at("/data/status").asText());
         asha2.next("COORDINATOR_BACK");
 
@@ -100,8 +103,8 @@ class SurveyFlowTest {
 
     @Test
     void pausedSurveyEndsWhenPcDoesNotReturn() throws Exception {
-        Client l = connect("S2", "l1", "PARTICIPANT");
-        Client pc = connect("S2", "pc", "COORDINATOR");
+        Client l = connect(run + "S2", "l1", "PARTICIPANT");
+        Client pc = connect(run + "S2", "pc", "COORDINATOR");
         pc.send("START_SESSION", Map.of());
         l.next("SESSION_STARTED");
         pc.close();
@@ -111,8 +114,8 @@ class SurveyFlowTest {
 
     @Test
     void legacyQuestionRelay() throws Exception {
-        Client trainer = connectRaw("/ws?room=LEG&clientId=trainer&role=trainer");
-        Client learner = connectRaw("/ws?room=LEG&clientId=l1&role=learner");
+        Client trainer = connectRaw("/ws?room=" + run + "LEG&clientId=trainer&role=trainer");
+        Client learner = connectRaw("/ws?room=" + run + "LEG&clientId=l1&role=learner");
         assertNotNull(learner.nextWhere("type", "CONNECTED"));
         trainer.nextWhere("type", "CONNECTED");
         trainer.sendRaw("{\"type\":\"QUESTION\",\"eventId\":\"E1\",\"payload\":\"hi\"}");

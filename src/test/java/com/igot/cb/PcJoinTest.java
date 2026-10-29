@@ -16,8 +16,11 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 
 /** Default settings: the PC joining creates the session; 200 participants per session. */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "rts.store=memory")
 class PcJoinTest {
+
+    /** Unique per test run: the Redis store keeps keys between runs. */
+    final String run = "T" + java.util.UUID.randomUUID().toString().substring(0, 6) + "-";
 
     @LocalServerPort
     int port;
@@ -30,10 +33,10 @@ class PcJoinTest {
 
     @Test
     void pcJoinCreatesSessionAndCapIs200() throws Exception {
-        Client early = connect("J1", "early", "PARTICIPANT");
+        Client early = connect(run + "J1", "early", "PARTICIPANT");
         assertEquals("WAITING", early.next("SESSION_STATE").at("/data/status").asText());
 
-        Client pc = connect("J1", "pc", "COORDINATOR");
+        Client pc = connect(run + "J1", "pc", "COORDINATOR");
         JsonNode state = pc.next("SESSION_STATE");
         assertEquals("LIVE", state.at("/data/status").asText(), "PC joining starts the session");
         String roomId = state.at("/data/roomId").asText();
@@ -48,23 +51,23 @@ class PcJoinTest {
         // 199 more learners = 200 participants; the 201st is refused
         List<Client> learners = new ArrayList<>();
         for (int i = 1; i <= 199; i++) {
-            learners.add(connect("J1", "u" + i, "PARTICIPANT"));
+            learners.add(connect(run + "J1", "u" + i, "PARTICIPANT"));
         }
         for (Client l : learners) {
             assertEquals("LIVE", l.next("SESSION_STATE").at("/data/status").asText());
         }
-        Client extra = connect("J1", "u200", "PARTICIPANT");
+        Client extra = connect(run + "J1", "u200", "PARTICIPANT");
         assertEquals("PARTICIPANT_LIMIT_REACHED", extra.next("ERROR").at("/error/code").asText());
         assertTrue(extra.closed.await(), "refused socket is closed");
 
         // the same user on a second tab is not a new participant
-        Client secondTab = connect("J1", "u1", "PARTICIPANT");
+        Client secondTab = connect(run + "J1", "u1", "PARTICIPANT");
         assertEquals("LIVE", secondTab.next("SESSION_STATE").at("/data/status").asText());
 
         // a different session on the same pod has its own 200
-        Client pc2 = connect("J2", "pc2", "COORDINATOR");
+        Client pc2 = connect(run + "J2", "pc2", "COORDINATOR");
         assertEquals("LIVE", pc2.next("SESSION_STATE").at("/data/status").asText());
-        Client other = connect("J2", "x1", "PARTICIPANT");
+        Client other = connect(run + "J2", "x1", "PARTICIPANT");
         assertEquals("LIVE", other.next("SESSION_STATE").at("/data/status").asText());
 
         assertEquals(2, stats.snapshot().get("sessions") instanceof Map<?, ?> m ? m.get("live") : null);

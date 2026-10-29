@@ -1,5 +1,6 @@
 package com.igot.cb;
 
+import java.util.UUID;
 import org.springframework.web.reactive.socket.CloseStatus;
 import org.springframework.web.reactive.socket.WebSocketMessage;
 import org.springframework.web.reactive.socket.WebSocketSession;
@@ -8,14 +9,16 @@ import reactor.core.publisher.Sinks;
 import reactor.util.concurrent.Queues;
 
 /**
- * One WebSocket. Frames go through a bounded per-socket queue; when it is full the client is reading too slowly
- * and is dropped (1008), so one slow phone cannot make the pod buffer without limit.
+ * One WebSocket on this pod. Frames go through a bounded per-socket queue; when it is full the client is reading
+ * too slowly and is dropped (1008), so one slow phone cannot make the pod buffer without limit.
  */
 public final class Conn {
 
     public static final CloseStatus TOO_SLOW = new CloseStatus(1008, "TOO_SLOW");
     public static final CloseStatus CONNECTION_LOST = new CloseStatus(1001, "CONNECTION_LOST");
 
+    /** Unique per socket (PC sockets are counted by id across pods). */
+    final String connId = UUID.randomUUID().toString();
     final WebSocketSession ws;
     final String code;
     final String userId;
@@ -27,15 +30,17 @@ public final class Conn {
     private final Sinks.Many<WebSocketMessage> out;
 
     volatile long lastSeen = System.currentTimeMillis();
-    /** Counted in the session (false when refused, e.g. participant limit). */
+    /** Counted in the survey (false when refused, e.g. participant limit). */
     volatile boolean joined;
     /** LEAVE or END_SESSION sent: the close that follows is not a network loss. */
     volatile boolean explicitLeave;
-    /** Survey ended: the close that follows is expected. */
+    /** Survey ended or pod shutting down: the close that follows is expected. */
     volatile boolean ended;
     /** Closed by the server's dead-connection sweep or as too slow: reported as CONNECTION_LOST. */
     volatile boolean lostByServer;
-    /** No new frames accepted. */
+    /** Last LIVE_STATS sent to this PC (only sent when it changes). */
+    volatile String lastLiveStats = "";
+
     private boolean done;
     private boolean completed;
 
@@ -59,7 +64,7 @@ public final class Conn {
         lastSeen = System.currentTimeMillis();
     }
 
-    /** Queues one text frame. Returns false if the socket is gone or too slow (then it is closed). */
+    /** Queues one text frame. False if the socket is gone or too slow (then it is closed). */
     boolean send(byte[] frame) {
         Sinks.EmitResult r;
         synchronized (this) {
