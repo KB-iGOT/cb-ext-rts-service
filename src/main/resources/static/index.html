@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Real Time Survey</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --ink:#1d2433; --muted:#5f6b7c; --line:#dde1e7; --brand:#1f4e9c;
+          --ok:#1f7a4d; --warn:#b45309; --bad:#c0392b; --bar:#3b6fd1; --chip:#eef2f8; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12151b; --card:#1b2029; --ink:#e7ebf2; --muted:#9aa5b5; --line:#2c3340; --brand:#6d9cf0;
+            --ok:#4cc38a; --warn:#f0a44b; --bad:#f07167; --bar:#6d9cf0; --chip:#232a36; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.45 system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; align-items:center; gap:10px; padding:12px 16px; background:var(--brand); color:#fff; flex-wrap:wrap; }
+  header h1 { margin:0; font-size:18px; flex:1; }
+  .pill { font-size:13px; padding:3px 10px; border-radius:99px; background:rgba(255,255,255,.18); }
+  main { max-width:760px; margin:0 auto; padding:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:14px; }
+  .card h2 { margin:0 0 10px; font-size:14px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  label { display:block; margin:8px 0 4px; font-size:14px; color:var(--muted); }
+  input, select, textarea { width:100%; padding:10px; font:inherit; color:var(--ink); background:var(--bg);
+          border:1px solid var(--line); border-radius:8px; }
+  textarea { min-height:80px; }
+  button { font:inherit; padding:10px 14px; border:0; border-radius:8px; background:var(--brand); color:#fff; cursor:pointer; }
+  button.secondary { background:var(--chip); color:var(--ink); border:1px solid var(--line); }
+  button.danger { background:var(--bad); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  .row > * { flex:1 1 140px; }
+  .hidden { display:none !important; }
+  .status { font-size:20px; font-weight:600; margin:0 0 6px; }
+  .muted { color:var(--muted); font-size:14px; }
+  .qtext { font-size:20px; font-weight:600; margin:4px 0 12px; }
+  .opts { display:grid; gap:8px; }
+  .opt { text-align:left; padding:14px; font-size:17px; background:var(--chip); color:var(--ink); border:2px solid var(--line); }
+  .opt.selected { border-color:var(--brand); }
+  .opt.correct { border-color:var(--ok); background:color-mix(in srgb, var(--ok) 15%, var(--chip)); }
+  .msg { margin-top:10px; font-weight:600; }
+  .msg.ok { color:var(--ok); } .msg.bad { color:var(--bad); } .msg.warn { color:var(--warn); }
+  .bars { display:grid; gap:6px; margin-top:8px; }
+  .bar { display:grid; grid-template-columns: minmax(80px, 35%) 1fr 48px; gap:8px; align-items:center; font-size:14px; }
+  .bar .track { height:14px; background:var(--chip); border-radius:7px; overflow:hidden; }
+  .bar .fill { height:100%; background:var(--bar); }
+  .stats { display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; }
+  .stat { background:var(--chip); border-radius:8px; padding:10px; text-align:center; }
+  .stat b { display:block; font-size:24px; }
+  .people { display:flex; flex-wrap:wrap; gap:6px; }
+  .person { background:var(--chip); border-radius:99px; padding:3px 10px; font-size:13px; }
+  .person.left { opacity:.45; text-decoration:line-through; }
+  .feed { max-height:180px; overflow:auto; font-size:14px; }
+  .feed div { padding:4px 0; border-bottom:1px solid var(--line); }
+  #log { font:12px/1.4 ui-monospace, Menlo, Consolas, monospace; white-space:pre-wrap; max-height:260px; overflow:auto; color:var(--muted); }
+  .toast { position:fixed; left:50%; bottom:16px; transform:translateX(-50%); background:var(--ink); color:var(--bg);
+           padding:10px 14px; border-radius:8px; font-size:14px; max-width:90vw; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Real Time Survey</h1>
+  <span class="pill" id="who">not joined</span>
+  <span class="pill" id="pod" title="Server pod this device is connected to">pod: -</span>
+</header>
+<main>
+
+  <!-- Join -->
+  <section class="card" id="joinCard">
+    <h2>Join a survey</h2>
+    <label for="code">Survey code</label>
+    <input id="code" value="DEMO" autocomplete="off">
+    <label for="name">Your name</label>
+    <input id="name" placeholder="e.g. Asha" autocomplete="off">
+    <label for="role">I am</label>
+    <select id="role">
+      <option value="PARTICIPANT">a learner</option>
+      <option value="COORDINATOR">the coordinator (PC)</option>
+    </select>
+    <div class="row" style="margin-top:12px"><button id="joinBtn">Join</button></div>
+    <p class="muted">Everyone uses the same survey code. When the coordinator joins, the survey starts.</p>
+  </section>
+
+  <!-- Status (both roles) -->
+  <section class="card hidden" id="statusCard">
+    <p class="status" id="status">Connecting…</p>
+    <p class="muted" id="statusSub"></p>
+    <div class="row"><button class="secondary hidden" id="reconnectBtn">Reconnect</button></div>
+  </section>
+
+  <!-- Learner -->
+  <section class="card hidden" id="learnerCard">
+    <h2>Question</h2>
+    <div id="noQuestion" class="muted">No question yet. Wait for the coordinator.</div>
+    <div id="question" class="hidden">
+      <div class="muted" id="qMeta"></div>
+      <div class="qtext" id="qText"></div>
+      <div class="opts" id="qOpts"></div>
+      <div id="qFree" class="hidden">
+        <textarea id="qFreeInput" maxlength="500"></textarea>
+        <div class="row" style="margin-top:8px"><button id="qFreeSend">Submit</button></div>
+      </div>
+      <div class="row hidden" id="multiSendRow" style="margin-top:8px"><button id="multiSend">Submit</button></div>
+      <div class="msg" id="answerMsg"></div>
+    </div>
+    <div id="learnerResults" class="hidden">
+      <h2 style="margin-top:16px">Results</h2>
+      <div class="bars" id="learnerBars"></div>
+    </div>
+  </section>
+
+  <!-- Coordinator -->
+  <section class="card hidden" id="pcCard">
+    <h2>Live</h2>
+    <div class="stats">
+      <div class="stat"><b id="sConnected">0</b>connected</div>
+      <div class="stat"><b id="sDelivered">-</b>question reached</div>
+      <div class="stat"><b id="sAnswered">-</b>answered</div>
+    </div>
+    <p class="muted" id="delivery"></p>
+    <h2 style="margin-top:14px">Learners</h2>
+    <div class="people" id="people"><span class="muted">Nobody yet</span></div>
+  </section>
+
+  <section class="card hidden" id="composeCard">
+    <h2>Push a question</h2>
+    <label for="qType">Type</label>
+    <select id="qType">
+      <option value="SINGLE">Single choice</option>
+      <option value="MULTI">Multiple choice</option>
+      <option value="WORD_CLOUD">Word cloud (1-3 words)</option>
+      <option value="TEXT">Free text</option>
+    </select>
+    <label for="qTextIn">Question</label>
+    <input id="qTextIn" value="How was today's session?">
+    <div id="optsBlock">
+      <label for="qOptsIn">Options (one per line)</label>
+      <textarea id="qOptsIn">Very useful
+Useful
+Not useful</textarea>
+      <label for="qCorrect">Correct option numbers, e.g. 1 or 1,3 (leave empty for a poll)</label>
+      <input id="qCorrect" placeholder="">
+    </div>
+    <label for="qTimer">Timer in seconds (0 = no timer)</label>
+    <input id="qTimer" type="number" min="0" value="0">
+    <div class="row" style="margin-top:12px"><button id="pushBtn">Push question</button></div>
+  </section>
+
+  <section class="card hidden" id="controlCard">
+    <h2>Current question</h2>
+    <div class="qtext" id="pcQText">-</div>
+    <div class="row">
+      <button class="secondary" id="stopBtn">Stop answers</button>
+      <button class="secondary" id="resumeBtn">Resume answers</button>
+      <button class="secondary" id="showBtn">Show results</button>
+      <button class="secondary" id="revealBtn">Reveal answer</button>
+    </div>
+    <h2 style="margin-top:16px">Live results</h2>
+    <div class="bars" id="pcBars"><span class="muted">No answers yet</span></div>
+    <div id="textFeedBox" class="hidden">
+      <h2 style="margin-top:16px">Text answers</h2>
+      <div class="feed" id="textFeed"></div>
+    </div>
+    <div class="row" style="margin-top:16px"><button class="danger" id="endBtn">End survey for everyone</button></div>
+  </section>
+
+  <!-- Log (both roles) -->
+  <section class="card hidden" id="logCard">
+    <details>
+      <summary class="muted">Messages from the server (for testing)</summary>
+      <div id="log"></div>
+    </details>
+  </section>
+</main>
+<div class="toast hidden" id="toast"></div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let ws, me = {}, seq = 0, push = null, pendingPush = null, myChoice = new Set(), answered = false, closedByUs = false;
+
+  // ---------------------------------------------------------------- helpers
+  const show = (id, on = true) => $(id).classList.toggle('hidden', !on);
+  const toast = t => { $('toast').textContent = t; show('toast'); clearTimeout(toast.t); toast.t = setTimeout(() => show('toast', false), 3500); };
+  const log = (dir, obj) => { const l = $('log'); l.textContent = `${dir} ${JSON.stringify(obj)}\n` + l.textContent.slice(0, 20000); };
+  const store = { get: k => { try { return localStorage.getItem(k); } catch (e) { return null; } },
+                  set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} } };
+  const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+  function wsUrl(params) {
+    // works at "/" (laptop, Docker) and under a path prefix such as "/rts/" (dev ingress)
+    let base = location.pathname.endsWith('/') ? location.pathname : location.pathname.replace(/[^/]*$/, '');
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${proto}//${location.host}${base}ws?${new URLSearchParams(params)}`;
+  }
+  function send(event, data = {}) {
+    if (!ws || ws.readyState !== 1) { toast('Not connected'); return; }
+    const f = { event, requestId: 'r' + (++seq), data };
+    ws.send(JSON.stringify(f)); log('→', f);
+  }
+  function setStatus(main, sub = '') { $('status').textContent = main; $('statusSub').textContent = sub; }
+
+  // ---------------------------------------------------------------- join
+  $('name').value = store.get('rts.name') || '';
+  $('joinBtn').onclick = () => {
+    const code = $('code').value.trim(), name = $('name').value.trim(), role = $('role').value;
+    if (!code || !name) { toast('Enter the survey code and your name'); return; }
+    store.set('rts.name', name);
+    // the same person keeps the same id on reconnect (so "already answered" works)
+    const key = `rts.id.${code}.${role}.${name}`;
+    let userId = store.get(key);
+    if (!userId) { userId = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 20) + '-' + Math.random().toString(36).slice(2, 6); store.set(key, userId); }
+    me = { code, name, role, userId };
+    connect();
+  };
+  $('reconnectBtn').onclick = () => connect();
+
+  function connect() {
+    closedByUs = false;
+    show('joinCard', false); show('statusCard'); show('logCard'); show('reconnectBtn', false);
+    $('who').textContent = `${me.name} · ${me.role === 'COORDINATOR' ? 'PC' : 'learner'} · ${me.code}`;
+    setStatus('Connecting…');
+    ws = new WebSocket(wsUrl({ rtsCode: me.code, userId: me.userId, role: me.role, name: me.name }));
+    ws.onmessage = e => { const f = JSON.parse(e.data); log('←', f); handle(f); };
+    ws.onclose = e => {
+      if (closedByUs) return;
+      setStatus(e.code === 1000 ? 'Disconnected' : 'Connection lost', `close code ${e.code} ${e.reason || ''}`);
+      show('reconnectBtn', e.code !== 4429);
+      disableAnswers(true);
+    };
+    ws.onerror = () => {};
+    const pc = me.role === 'COORDINATOR';
+    show('learnerCard', !pc); show('pcCard', pc); show('composeCard', pc); show('controlCard', pc);
+  }
+
+  // ---------------------------------------------------------------- server events
+  function handle(f) {
+    const d = f.data || {};
+    if (f.status === 'ERROR' || f.event === 'ERROR') {
+      const code = f.error && f.error.code;
+      toast((code || 'Error') + (f.error && f.error.message ? ': ' + f.error.message : ''));
+      if (code === 'PARTICIPANT_LIMIT_REACHED') setStatus('Survey is full', 'This survey already has the maximum number of participants.');
+      return;
+    }
+    switch (f.event) {
+      case 'SESSION_STATE':
+        $('pod').textContent = 'pod: ' + (d.pod || '-');
+        statusFrom(d.status);
+        if (me.role === 'COORDINATOR') {
+          $('sConnected').textContent = d.connected ?? 0;
+          if (d.currentPush) setPcQuestion(d.currentPush);
+        } else if (d.currentPush && (d.status === 'LIVE' || d.status === 'PAUSED')) {
+          renderQuestion(d.currentPush);
+          if (d.myAnswer && d.myAnswer.status === 'RECORDED') { answered = true; answerMsg('Response recorded ✓', 'ok'); disableAnswers(true); }
+        }
+        break;
+      case 'SESSION_STARTED': statusFrom('LIVE'); break;
+      case 'COORDINATOR_AWAY': setStatus('Coordinator reconnecting…', 'Please wait. The survey continues when the coordinator is back.'); break;
+      case 'COORDINATOR_BACK': statusFrom('LIVE'); break;
+      case 'SESSION_ENDED':
+        closedByUs = true;
+        setStatus('Survey ended', ({ENDED_BY_COORDINATOR:'The coordinator ended the survey.', COORDINATOR_LEFT:'The coordinator left.', COORDINATOR_TIMEOUT:'The coordinator did not come back.'})[d.reason] || '');
+        disableAnswers(true); disablePc(true);
+        break;
+      case 'QUESTION_PUSHED': renderQuestion(d); break;
+      case 'ANSWERS_STOPPED':
+        if (push && d.pushId === push.pushId) {
+          push.answersOpen = false;
+          if (me.role !== 'COORDINATOR' && !answered) answerMsg(d.reason === 'TIMER' ? 'Time is up' : 'Responses closed', 'warn');
+          disableAnswers(true);
+        }
+        break;
+      case 'ANSWERS_RESUMED':
+        if (push && d.pushId === push.pushId) { push.answersOpen = true; if (!answered) { answerMsg('', ''); disableAnswers(false); } }
+        break;
+      case 'SUBMIT_ANSWER_RESULT':
+        if (f.status === 'RECORDED') { answered = true; answerMsg('Response recorded ✓', 'ok'); disableAnswers(true); }
+        else answerMsg('Not recorded: ' + (f.error && f.error.code), 'bad');
+        break;
+      case 'RESULTS_SHOWN':
+        if (me.role !== 'COORDINATOR') { show('learnerResults'); bars('learnerBars', d); }
+        else bars('pcBars', d);
+        break;
+      case 'ANSWER_REVEALED':
+        (d.correct || []).forEach(i => { const b = document.querySelector(`.opt[data-i="${i}"]`); if (b) b.classList.add('correct'); });
+        if (me.role !== 'COORDINATOR') answerMsg((document.getElementById('answerMsg').textContent || '') + '  ·  Correct answer shown', 'ok');
+        else toast('Correct answer revealed to everyone');
+        break;
+      // ----- coordinator only
+      case 'PUSH_QUESTION_RESULT':
+        if (pendingPush) { setPcQuestion({ ...pendingPush, pushId: d.pushId, endsAt: d.endsAt }); pendingPush = null; }
+        toast('Question pushed');
+        break;
+      case 'PARTICIPANT_JOINED': $('sConnected').textContent = d.connected; person(d.name || d.userId, d.userId, false, d.pod); break;
+      case 'PARTICIPANT_LEFT': $('sConnected').textContent = d.connected; person(d.name || d.userId, d.userId, true); break;
+      case 'LIVE_STATS':
+        $('sConnected').textContent = d.connected; $('sDelivered').textContent = d.delivered; $('sAnswered').textContent = d.answered;
+        break;
+      case 'LIVE_RESULTS': bars('pcBars', d); break;
+      case 'LIVE_TEXT_ANSWERS':
+        show('textFeedBox');
+        (d.items || []).forEach(it => { const div = document.createElement('div'); div.innerHTML = `<b>${esc(it.name)}</b>: ${esc(it.text)}`; $('textFeed').prepend(div); });
+        break;
+      case 'PUSH_DELIVERY':
+        $('delivery').textContent = `Question ${d.pushId} reached ${d.delivered} learner(s)` + (d.failed && d.failed.length ? `, failed for ${d.failed.map(x => x.userId).join(', ')}` : '');
+        break;
+      case 'END_SESSION_RESULT': case 'STOP_ANSWERS_RESULT': case 'RESUME_ANSWERS_RESULT':
+      case 'SHOW_RESULTS_RESULT': case 'REVEAL_ANSWER_RESULT': case 'START_SESSION_RESULT': break;
+    }
+  }
+
+  function statusFrom(s) {
+    const pc = me.role === 'COORDINATOR';
+    ({
+      WAITING: () => setStatus(pc ? 'Starting…' : 'Waiting for the coordinator', pc ? '' : 'Stay on this page. The survey starts when the coordinator joins.'),
+      LIVE: () => setStatus('Survey is live', pc ? 'Push a question below.' : 'Questions appear here when the coordinator pushes them.'),
+      PAUSED: () => setStatus('Coordinator reconnecting…', 'Please wait.'),
+      ENDED: () => setStatus('Survey ended', '')
+    }[s] || (() => setStatus(s)))();
+  }
+
+  // ---------------------------------------------------------------- learner
+  function renderQuestion(q) {
+    push = q; answered = false; myChoice = new Set();
+    show('noQuestion', false); show('question'); show('learnerResults', false);
+    $('qMeta').textContent = `Question ${q.pushId}` + (q.endsAt ? ' · timer running' : '');
+    $('qText').textContent = q.text;
+    answerMsg('', '');
+    const opts = $('qOpts'); opts.innerHTML = '';
+    const choice = q.type === 'SINGLE' || q.type === 'MULTI';
+    show('qFree', !choice); show('multiSendRow', q.type === 'MULTI');
+    if (choice) {
+      (q.options || []).forEach((o, i) => {
+        const b = document.createElement('button');
+        b.className = 'opt'; b.dataset.i = i; b.textContent = `${i + 1}. ${o}`;
+        b.onclick = () => {
+          if (q.type === 'SINGLE') { send('SUBMIT_ANSWER', { pushId: q.pushId, choice: [i] }); myChoice = new Set([i]); }
+          else { myChoice.has(i) ? myChoice.delete(i) : myChoice.add(i); }
+          document.querySelectorAll('.opt').forEach(x => x.classList.toggle('selected', myChoice.has(+x.dataset.i)));
+        };
+        opts.appendChild(b);
+      });
+    } else {
+      $('qFreeInput').value = '';
+      $('qFreeInput').placeholder = q.type === 'WORD_CLOUD' ? '1 to 3 words, separated by commas' : 'Your answer';
+    }
+    disableAnswers(q.answersOpen === false);
+    if (me.role === 'COORDINATOR') setPcQuestion(q);
+  }
+  $('multiSend').onclick = () => push && send('SUBMIT_ANSWER', { pushId: push.pushId, choice: [...myChoice] });
+  $('qFreeSend').onclick = () => {
+    if (!push) return;
+    const v = $('qFreeInput').value.trim();
+    if (push.type === 'WORD_CLOUD') send('SUBMIT_ANSWER', { pushId: push.pushId, words: v.split(',').map(s => s.trim()).filter(Boolean) });
+    else send('SUBMIT_ANSWER', { pushId: push.pushId, text: v });
+  };
+  function disableAnswers(off) {
+    document.querySelectorAll('#qOpts button, #qFreeSend, #multiSend, #qFreeInput').forEach(b => b.disabled = off);
+  }
+  function answerMsg(t, cls) { const m = $('answerMsg'); m.textContent = t; m.className = 'msg ' + cls; }
+
+  function bars(id, r) {
+    const el = $(id); el.innerHTML = '';
+    const total = r.total || 0;
+    let rows = [];
+    if (r.counts) rows = r.counts.map((n, i) => [(push && push.options && push.options[i]) || `Option ${i + 1}`, n]);
+    else if (r.top) rows = r.top.map(([w, n]) => [w, n]);
+    if (!rows.length) { el.innerHTML = `<span class="muted">${total} answer(s)</span>`; return; }
+    const max = Math.max(1, ...rows.map(x => x[1]));
+    rows.forEach(([label, n]) => {
+      const row = document.createElement('div'); row.className = 'bar';
+      row.innerHTML = `<span>${esc(label)}</span><span class="track"><span class="fill" style="width:${(100 * n / max).toFixed(0)}%"></span></span><span>${n}</span>`;
+      el.appendChild(row);
+    });
+    const t = document.createElement('div'); t.className = 'muted'; t.textContent = `${total} answer(s)`; el.appendChild(t);
+  }
+
+  // ---------------------------------------------------------------- coordinator
+  const people = new Map();
+  function person(name, id, left, pod) {
+    let el = people.get(id);
+    if (!el) {
+      if (!people.size) $('people').innerHTML = '';
+      el = document.createElement('span'); el.className = 'person'; people.set(id, el); $('people').appendChild(el);
+    }
+    el.textContent = name + (pod ? ` (${pod})` : el.dataset.pod ? ` (${el.dataset.pod})` : '');
+    if (pod) el.dataset.pod = pod;
+    el.classList.toggle('left', left);
+  }
+  function setPcQuestion(q) {
+    push = Object.assign({}, push, q);
+    $('pcQText').textContent = `${q.pushId}: ${q.text}`;
+    $('sDelivered').textContent = '-'; $('sAnswered').textContent = '0';
+    $('pcBars').innerHTML = '<span class="muted">No answers yet</span>';
+    $('textFeed').innerHTML = ''; show('textFeedBox', q.type === 'TEXT');
+    $('revealBtn').disabled = !(q.correct && q.correct.length);
+  }
+  $('qType').onchange = () => show('optsBlock', ['SINGLE', 'MULTI'].includes($('qType').value));
+  $('pushBtn').onclick = () => {
+    const type = $('qType').value, text = $('qTextIn').value.trim();
+    if (!text) { toast('Write the question'); return; }
+    const q = { questionId: 'Q-' + Date.now(), type, text };
+    if (type === 'SINGLE' || type === 'MULTI') {
+      q.options = $('qOptsIn').value.split('\n').map(s => s.trim()).filter(Boolean);
+      const c = $('qCorrect').value.split(',').map(s => parseInt(s.trim(), 10) - 1).filter(n => !isNaN(n));
+      if (c.length) q.correct = c;
+    }
+    if (type === 'TEXT') q.maxChars = 500;
+    const timerSec = parseInt($('qTimer').value, 10) || 0;
+    // keep the full question (options, correct) for the result labels and the reveal button
+    pendingPush = q;
+    send('PUSH_QUESTION', { questionId: q.questionId, question: q, timerSec });
+  };
+  $('stopBtn').onclick = () => push && send('STOP_ANSWERS', { pushId: push.pushId });
+  $('resumeBtn').onclick = () => push && send('RESUME_ANSWERS', { pushId: push.pushId });
+  $('showBtn').onclick = () => push && send('SHOW_RESULTS', { pushId: push.pushId });
+  $('revealBtn').onclick = () => push && send('REVEAL_ANSWER', { pushId: push.pushId });
+  $('endBtn').onclick = () => { if (confirm('End the survey for everyone?')) send('END_SESSION'); };
+  function disablePc(off) { document.querySelectorAll('#composeCard button, #controlCard button').forEach(b => b.disabled = off); }
+})();
+</script>
+</body>
+</html>

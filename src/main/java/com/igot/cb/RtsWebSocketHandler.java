@@ -1,5 +1,6 @@
 package com.igot.cb;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.Logger;
@@ -15,6 +16,7 @@ import reactor.core.publisher.Mono;
 
 /**
  * One call per socket: read who it is from the URL, join the survey, process frames in order, clean up.
+ * Any pod can serve any socket: the survey state is in the {@link SessionStore}.
  *
  * <p>URL (dev identity, no auth — this service measures capacity):
  * {@code /ws?rtsCode=482913&userId=asha&role=PARTICIPANT|COORDINATOR&name=Asha}.
@@ -25,7 +27,8 @@ import reactor.core.publisher.Mono;
 public class RtsWebSocketHandler implements WebSocketHandler {
 
     private static final Logger log = LoggerFactory.getLogger(RtsWebSocketHandler.class);
-    private static final CloseStatus LIMIT = new CloseStatus(4429, "PARTICIPANT_LIMIT_REACHED");
+    static final CloseStatus LIMIT = new CloseStatus(4429, "PARTICIPANT_LIMIT_REACHED");
+    private static final CloseStatus TRY_AGAIN = new CloseStatus(1011, "TRY_AGAIN");
 
     private final SessionManager manager;
     private final Stats stats;
@@ -45,8 +48,10 @@ public class RtsWebSocketHandler implements WebSocketHandler {
     @Override
     public Mono<Void> handle(WebSocketSession session) {
         stats.handshakes.increment();
-        Map<String, String> q = UriComponentsBuilder.fromUri(session.getHandshakeInfo().getUri()).build()
-                .getQueryParams().toSingleValueMap();
+        // decoded like a form: "Ravi+Kumar" and "Ravi%20Kumar" both become "Ravi Kumar" (browsers send "+")
+        Map<String, String> q = new java.util.HashMap<>();
+        UriComponentsBuilder.fromUri(session.getHandshakeInfo().getUri()).build().getQueryParams().toSingleValueMap()
+                .forEach((k, v) -> q.put(k, v == null ? null : java.net.URLDecoder.decode(v, StandardCharsets.UTF_8)));
         boolean legacy = !q.containsKey("rtsCode") && q.containsKey("room");
         String code = legacy ? q.get("room") : q.get("rtsCode");
         String userId = q.getOrDefault("userId", q.getOrDefault("clientId", "unknown"));
@@ -61,14 +66,27 @@ public class RtsWebSocketHandler implements WebSocketHandler {
         }
 
         Conn c = new Conn(session, code, userId, name, coordinator, legacy, ws.sendQueue(), stats);
-        if (!manager.join(c)) {
-            stats.rejected.increment();
-            c.send(frames.error(null, "PARTICIPANT_LIMIT_REACHED", "This survey already has the maximum participants"));
-            c.finish();
-            return session.send(c.outbound()).then(session.close(LIMIT));
-        }
-        stats.connected(coordinator);
-        boolean logIt = legacy || ws.logConnections();
+        return manager.join(c)
+                .onErrorResume(e -> {
+                    log.warn("Join of {} to {} failed", userId, code, e);
+                    return Mono.just(Boolean.FALSE).doOnNext(x -> c.lostByServer = true);
+                })
+                .flatMap(ok -> {
+                    if (ok) {
+                        return lifecycle(session, c, role);
+                    }
+                    stats.rejected.increment();
+                    boolean full = !c.lostByServer;
+                    c.send(full ? manager.limitError()
+                            : frames.error(null, "TRY_AGAIN", "Service busy, please reconnect"));
+                    c.finish();
+                    return session.send(c.outbound()).then(session.close(full ? LIMIT : TRY_AGAIN));
+                });
+    }
+
+    private Mono<Void> lifecycle(WebSocketSession session, Conn c, String role) {
+        stats.connected(c.coordinator);
+        boolean logIt = c.legacy || ws.logConnections();
         if (logIt) {
             log.info("CONNECT pod={} client={} name={} role={} room={} sessionId={}", pod, userId, name, role, code,
                     session.getId());
@@ -77,13 +95,12 @@ public class RtsWebSocketHandler implements WebSocketHandler {
         AtomicReference<CloseStatus> closeStatus = new AtomicReference<>();
         session.closeStatus().subscribe(closeStatus::set, e -> { });
 
+        // frames of one socket are handled strictly in order (a PC's PUSH can't overtake its own STOP)
         Mono<Void> inbound = session.receive()
-                .doOnNext(m -> {
-                    c.touch();
-                    if (m.getType() == WebSocketMessage.Type.TEXT) {
-                        manager.onFrame(c, m.getPayloadAsText());
-                    }
-                })
+                .doOnNext(m -> c.touch())
+                .filter(m -> m.getType() == WebSocketMessage.Type.TEXT)
+                .map(WebSocketMessage::getPayloadAsText)
+                .concatMap(text -> manager.onFrame(c, text))
                 .onErrorResume(e -> Mono.empty())
                 // peer gone: stop the outbound side too
                 .doFinally(sig -> c.finish())
@@ -93,9 +110,15 @@ public class RtsWebSocketHandler implements WebSocketHandler {
                 .onErrorResume(e -> Mono.empty())
                 .then(Mono.defer(() -> session.isOpen() ? session.close(CloseStatus.NORMAL) : Mono.empty()));
 
-        manager.onJoined(c);
-        return Mono.when(inbound, outbound).doFinally(sig -> {
-            stats.disconnected(coordinator);
+        Mono<Void> joined = manager.onJoined(c).onErrorResume(e -> {
+            log.warn("Session state for {} in {} failed: {}", c.userId, c.code, e.toString());
+            c.send(frames.error(null, "TRY_AGAIN", "Temporary problem, please reconnect"));
+            c.lostByServer = true;
+            c.finish();
+            return Mono.empty();
+        });
+        return Mono.when(joined.then(inbound), outbound).doFinally(sig -> {
+            stats.disconnected(c.coordinator);
             CloseStatus st = closeStatus.get();
             boolean clean = c.explicitLeave || c.ended || (!c.lostByServer && st != null
                     && (st.getCode() == 1000 || st.getCode() == 1001));
@@ -104,10 +127,10 @@ public class RtsWebSocketHandler implements WebSocketHandler {
                 stats.unexpectedCloses.increment();
             }
             if (logIt) {
-                log.info("DISCONNECT pod={} client={} room={} reason={} close={}", pod, userId, code, reason,
-                        closeStatus.get());
+                log.info("DISCONNECT pod={} client={} room={} reason={} close={}", pod, c.userId, c.code, reason, st);
             }
-            manager.onLeft(c, reason);
+            manager.onLeft(c, reason)
+                    .subscribe(null, e -> log.warn("Leave of {} from {} failed: {}", c.userId, c.code, e.toString()));
         });
     }
 }
