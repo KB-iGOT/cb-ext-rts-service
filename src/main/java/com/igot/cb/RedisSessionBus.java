@@ -8,7 +8,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.redis.connection.ReactiveRedisConnectionFactory;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import org.springframework.data.redis.listener.ChannelTopic;
@@ -26,7 +25,6 @@ import reactor.core.scheduler.Schedulers;
  * SESSION_STATE on reconnect, and every event carries the current pushId).
  */
 @Component
-@ConditionalOnProperty(name = "rts.store", havingValue = "redis", matchIfMissing = true)
 public class RedisSessionBus implements SessionBus {
 
     private static final Logger log = LoggerFactory.getLogger(RedisSessionBus.class);

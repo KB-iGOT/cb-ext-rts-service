@@ -10,14 +10,22 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 
 /** Default settings: the PC joining creates the session; 200 participants per session. */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "rts.store=memory")
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+        properties = {"rts.auth.mode=dev"})
 class PcJoinTest {
+
+    @BeforeAll
+    static void needsRedis() {
+        Assumptions.assumeTrue(RedisAvailable.up(), "Redis not running on localhost:6379");
+    }
 
     /** Unique per test run: the Redis store keeps keys between runs. */
     final String run = "T" + java.util.UUID.randomUUID().toString().substring(0, 6) + "-";

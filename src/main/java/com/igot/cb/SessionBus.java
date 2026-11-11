@@ -5,7 +5,7 @@ import reactor.core.publisher.Mono;
 
 /**
  * Carries one survey event to every pod that holds sockets of that survey; each pod then writes it to its own
- * sockets. rts.store=redis: Redis pub/sub, one channel per survey (rts:room:{code}). memory: delivered in-process.
+ * sockets. Redis pub/sub, one channel per survey (rts:room:{code}).
  * One message per event, not per person.
  */
 public interface SessionBus {

@@ -11,8 +11,8 @@ import java.util.Map;
 import reactor.core.publisher.Mono;
 
 /**
- * Live state of every survey, keyed by RTS code. rts.store=redis (default): shared by all pods (any pod serves
- * anyone, state survives a pod restart). rts.store=memory: this pod only (single-pod capacity tests).
+ * Live state of every survey, keyed by RTS code, in Redis: shared by all pods (any pod serves anyone, state
+ * survives a pod restart).
  * Every change is atomic per survey. Mono.empty() = "condition not met, nothing changed".
  */
 public interface SessionStore {
@@ -43,9 +43,15 @@ public interface SessionStore {
     /** Sets "shown" or "revealed" on the current question. Empty if pushId is not current. */
     Mono<PushView> mark(String code, String pushId, String field);
 
-    /** RECORDED, ALREADY_ANSWERED, ANSWERS_STOPPED, NOT_CURRENT_QUESTION or NO_ACTIVE_QUESTION. */
-    Mono<String> submit(String code, String pushId, String userId, List<Integer> choice, List<String> words,
-            long now);
+    /**
+     * RECORDED, ALREADY_ANSWERED, ANSWERS_STOPPED, NOT_CURRENT_QUESTION or NO_ACTIVE_QUESTION. text (free-text
+     * questions) is kept with the learner's name so a PC who reconnects sees the answers again.
+     */
+    Mono<String> submit(String code, String pushId, String userId, String name, List<Integer> choice,
+            List<String> words, String text, long now);
+
+    /** Free-text answers to pushId, oldest first. */
+    Mono<List<SessionView.TextAnswer>> textAnswers(String code, String pushId);
 
     Mono<Boolean> hasAnswered(String code, String pushId, String userId);
 
@@ -54,11 +60,14 @@ public interface SessionStore {
     /** choice: total + counts[]; word cloud: total + top words; text: total. */
     Mono<Map<String, Object>> results(String code, PushView push);
 
-    /** Adds a learner socket. Returns distinct learners connected, or -1 when the survey is full. */
-    Mono<Long> join(String code, String userId, int max);
+    /** Adds a learner socket and remembers the learner's name. Returns distinct learners connected, or -1 when full. */
+    Mono<Long> join(String code, String userId, String name, int max);
 
-    /** Removes a learner socket. Returns distinct learners still connected. */
-    Mono<Long> leave(String code, String userId);
+    /** Every learner who joined the survey, by name, with whether they are connected now (the PC's list). */
+    Mono<List<SessionView.Participant>> participants(String code);
+
+    /** Removes a learner socket. stillConnected: the learner has another socket (second tab, or reconnected). */
+    Mono<SessionView.Left> leave(String code, String userId);
 
     Mono<Long> connected(String code);
 
@@ -73,8 +82,4 @@ public interface SessionStore {
     Mono<Void> addDelivery(String code, String pushId, long delivered, Collection<String> failedUserIds);
 
     Mono<Delivery> delivery(String code, String pushId);
-
-    /** Nobody is connected on this pod any more: memory store drops a finished survey. Redis: keys expire. */
-    default void forget(String code) {
-    }
 }
