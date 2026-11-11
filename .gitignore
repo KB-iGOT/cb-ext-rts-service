@@ -3,3 +3,9 @@ target/
 !.mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/
+.idea/
+.metals/
+.vscode/
+.venv/
+*.iml
+__pycache__/

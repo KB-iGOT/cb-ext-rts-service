@@ -2,23 +2,26 @@ package com.igot.cb;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.igot.cb.SessionView.Delivery;
+import com.igot.cb.SessionView.Participant;
 import com.igot.cb.SessionView.PushResult;
 import com.igot.cb.SessionView.PushView;
 import com.igot.cb.SessionView.Question;
 import com.igot.cb.SessionView.StartResult;
 import com.igot.cb.SessionView.Status;
+import com.igot.cb.SessionView.TextAnswer;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.domain.Range;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
@@ -28,18 +31,21 @@ import reactor.core.scheduler.Schedulers;
  * Redis Cluster slot:
  * <pre>
  * rts:{code}:room              hash  roomId status coordinatorId pausedAt pushCount pushId q open endsAt shown revealed
- * rts:{code}:part              hash  learner userId -> open sockets (the 200 cap counts fields)
+ * rts:{code}:conn              hash  learner userId -> open sockets (the 200 cap counts fields). LLD K5, which is
+ *                                    a set there: a hash also tells one tab from two, so closing one of them (or
+ *                                    a stale socket on a crashed pod) does not count the learner out
+ * rts:{code}:names             hash  learner userId -> name, everyone who joined (the PC's list on reconnect)
  * rts:{code}:pcs               set   PC socket ids (pause only when the last PC socket is gone)
  * rts:{code}:{pushId}:ans      set   learners who answered
  * rts:{code}:{pushId}:cnt      hash  total, c0..cN
  * rts:{code}:{pushId}:words    zset  word -> count
+ * rts:{code}:{pushId}:texts    list  free-text answers {userId, name, text}, oldest first
  * rts:{code}:{pushId}:dlv      hash  ok = sockets the question was written to (summed over pods)
  * rts:{code}:{pushId}:dlvf     set   learners it could not be written to
  * </pre>
  * Every check-then-change is one Lua script, so pods never overwrite each other.
  */
 @Component
-@ConditionalOnProperty(name = "rts.store", havingValue = "redis", matchIfMissing = true)
 public class RedisSessionStore implements SessionStore {
 
     private static final RedisScript<String> START = RedisScript.of("""
@@ -117,6 +123,10 @@ public class RedisSessionStore implements SessionStore {
               for w in string.gmatch(ARGV[5], '[^\\31]+') do redis.call('ZINCRBY', KEYS[4], 1, w) end
               redis.call('PEXPIRE', KEYS[4], ARGV[6])
             end
+            if ARGV[7] ~= '' then
+              redis.call('RPUSH', KEYS[5], ARGV[7])
+              redis.call('PEXPIRE', KEYS[5], ARGV[6])
+            end
             redis.call('PEXPIRE', KEYS[2], ARGV[6])
             redis.call('PEXPIRE', KEYS[3], ARGV[6])
             return 'RECORDED'
@@ -131,13 +141,20 @@ public class RedisSessionStore implements SessionStore {
               redis.call('HSET', KEYS[1], ARGV[1], 1)
             end
             redis.call('PEXPIRE', KEYS[1], ARGV[3])
+            redis.call('HSET', KEYS[2], ARGV[1], ARGV[4])
+            redis.call('PEXPIRE', KEYS[2], ARGV[3])
             return redis.call('HLEN', KEYS[1])
             """, Long.class);
 
-    private static final RedisScript<Long> LEAVE = RedisScript.of("""
-            if redis.call('HINCRBY', KEYS[1], ARGV[1], -1) <= 0 then redis.call('HDEL', KEYS[1], ARGV[1]) end
-            return redis.call('HLEN', KEYS[1])
-            """, Long.class);
+    /** Returns "connected,still": still = 1 when the learner has another socket open (other tab, other pod). */
+    private static final RedisScript<String> LEAVE = RedisScript.of("""
+            local still = 1
+            if redis.call('HINCRBY', KEYS[1], ARGV[1], -1) <= 0 then
+              redis.call('HDEL', KEYS[1], ARGV[1])
+              still = 0
+            end
+            return redis.call('HLEN', KEYS[1]) .. ',' .. still
+            """, String.class);
 
     private static final String WORD_SEPARATOR = "\u001f";
 
@@ -162,8 +179,12 @@ public class RedisSessionStore implements SessionStore {
         return "rts:{" + code + "}:room";
     }
 
-    private static String part(String code) {
-        return "rts:{" + code + "}:part";
+    private static String conn(String code) {
+        return "rts:{" + code + "}:conn";
+    }
+
+    private static String names(String code) {
+        return "rts:{" + code + "}:names";
     }
 
     private static String pcs(String code) {
@@ -251,7 +272,22 @@ public class RedisSessionStore implements SessionStore {
     @Override
     public Mono<SessionView> end(String code) {
         return view(code).flatMap(before -> run(END, List.of(room(code)), ttlAfterEnd.toMillis())
-                .filter("1"::equals).map(ok -> before));
+                .filter("1"::equals)
+                .flatMap(ok -> expireAfterEnd(code, before.pushCount()).thenReturn(before)));
+    }
+
+    /**
+     * LLD §4.4 "clean-up after END": every key of the survey goes 1 h after the end (rts.room.ttl-after-end), not
+     * 12 h after its last write. The room key itself is set by the END script.
+     */
+    private Mono<Void> expireAfterEnd(String code, int pushCount) {
+        List<String> keys = new ArrayList<>(List.of(conn(code), names(code), pcs(code), "rts:{" + code + "}:roster"));
+        for (int i = 1; i <= pushCount; i++) {
+            for (String suffix : List.of("ans", "cnt", "words", "texts", "dlv", "dlvf")) {
+                keys.add(pushKey(code, "P-" + i, suffix));
+            }
+        }
+        return off(Flux.fromIterable(keys).flatMap(k -> redis.expire(k, ttlAfterEnd)).then());
     }
 
     // ---------------------------------------------------------------- questions
@@ -286,12 +322,30 @@ public class RedisSessionStore implements SessionStore {
     }
 
     @Override
-    public Mono<String> submit(String code, String pushId, String userId, List<Integer> choice, List<String> words,
-            long now) {
+    public Mono<String> submit(String code, String pushId, String userId, String name, List<Integer> choice,
+            List<String> words, String text, long now) {
         String choices = choice == null ? "" : choice.stream().map(String::valueOf).collect(Collectors.joining(","));
         String w = words == null ? "" : String.join(WORD_SEPARATOR, words);
+        String t;
+        try {
+            t = text == null ? "" : mapper.writeValueAsString(new TextAnswer(userId, name, text));
+        } catch (Exception e) {
+            return Mono.error(e);
+        }
         return run(SUBMIT, List.of(room(code), pushKey(code, pushId, "ans"), pushKey(code, pushId, "cnt"),
-                pushKey(code, pushId, "words")), pushId, userId, now, choices, w, ttl.toMillis());
+                pushKey(code, pushId, "words"), pushKey(code, pushId, "texts")), pushId, userId, now, choices, w,
+                ttl.toMillis(), t);
+    }
+
+    @Override
+    public Mono<List<TextAnswer>> textAnswers(String code, String pushId) {
+        return off(redis.opsForList().range(pushKey(code, pushId, "texts"), 0, -1).map(json -> {
+            try {
+                return mapper.readValue(json, TextAnswer.class);
+            } catch (Exception e) {
+                throw new IllegalStateException("Bad text answer", e);
+            }
+        }).collectList());
     }
 
     @Override
@@ -333,18 +387,32 @@ public class RedisSessionStore implements SessionStore {
     // ---------------------------------------------------------------- who is connected
 
     @Override
-    public Mono<Long> join(String code, String userId, int max) {
-        return run(JOIN, List.of(part(code)), userId, max, ttl.toMillis());
+    public Mono<Long> join(String code, String userId, String name, int max) {
+        return run(JOIN, List.of(conn(code), names(code)), userId, max, ttl.toMillis(), name);
     }
 
     @Override
-    public Mono<Long> leave(String code, String userId) {
-        return run(LEAVE, List.of(part(code)), userId);
+    public Mono<List<Participant>> participants(String code) {
+        Mono<Map<String, String>> names = redis.<String, String>opsForHash().entries(names(code))
+                .collectMap(Map.Entry::getKey, Map.Entry::getValue);
+        Mono<List<String>> connected = redis.<String, String>opsForHash().keys(conn(code)).collectList();
+        return off(Mono.zip(names, connected)).map(t -> t.getT1().entrySet().stream()
+                .map(e -> new Participant(e.getKey(), e.getValue(), t.getT2().contains(e.getKey())))
+                .sorted(Comparator.comparing(Participant::name, String.CASE_INSENSITIVE_ORDER))
+                .toList());
+    }
+
+    @Override
+    public Mono<SessionView.Left> leave(String code, String userId) {
+        return run(LEAVE, List.of(conn(code)), userId).map(r -> {
+            String[] p = r.split(",");
+            return new SessionView.Left(Long.parseLong(p[0]), "1".equals(p[1]));
+        });
     }
 
     @Override
     public Mono<Long> connected(String code) {
-        return off(redis.opsForHash().size(part(code)));
+        return off(redis.opsForHash().size(conn(code)));
     }
 
     @Override

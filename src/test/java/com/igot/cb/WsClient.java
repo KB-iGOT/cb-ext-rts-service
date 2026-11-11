@@ -23,6 +23,8 @@ final class WsClient {
         final BlockingQueue<JsonNode> in = new LinkedBlockingQueue<>();
         final Sinks.Many<String> out = Sinks.many().unicast().onBackpressureBuffer();
         final Latch closed = new Latch();
+        /** Close code the server sent (e.g. 4401, 4429), or 0. */
+        volatile int closeCode;
         final AtomicInteger seq = new AtomicInteger();
         final Disposable conn;
 
@@ -31,6 +33,7 @@ final class WsClient {
         Client(String url, ObjectMapper mapper) {
             this.mapper = mapper;
             conn = HttpClient.create().websocket().uri(url).handle((i, o) -> Mono.firstWithSignal(
+                    i.receiveCloseStatus().doOnNext(st -> closeCode = st.code()).then(Mono.never()),
                     i.receive().asString().doOnNext(t -> {
                         try {
                             in.add(mapper.readTree(t));

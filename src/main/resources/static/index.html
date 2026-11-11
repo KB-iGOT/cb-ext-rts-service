@@ -69,6 +69,7 @@
     <h2>Join a survey</h2>
     <label for="code">Survey code</label>
     <input id="code" value="DEMO" autocomplete="off">
+    <div id="whoBox">
     <label for="name">Your name</label>
     <input id="name" placeholder="e.g. Asha" autocomplete="off">
     <label for="role">I am</label>
@@ -76,6 +77,11 @@
       <option value="PARTICIPANT">a learner</option>
       <option value="COORDINATOR">the coordinator (PC)</option>
     </select>
+    </div>
+    <div id="tokenBox" class="hidden">
+      <label for="token">Access token (Keycloak)</label>
+      <input id="token" placeholder="paste the access token" autocomplete="off">
+    </div>
     <div class="row" style="margin-top:12px"><button id="joinBtn">Join</button></div>
     <p class="muted">Everyone uses the same survey code. When the coordinator joins, the survey starts.</p>
   </section>
@@ -148,6 +154,7 @@ Not useful</textarea>
   <section class="card hidden" id="controlCard">
     <h2>Current question</h2>
     <div class="qtext" id="pcQText">-</div>
+    <div class="msg" id="pcQState"></div>
     <div class="row">
       <button class="secondary" id="stopBtn">Stop answers</button>
       <button class="secondary" id="resumeBtn">Resume answers</button>
@@ -177,6 +184,8 @@ Not useful</textarea>
 (() => {
   const $ = id => document.getElementById(id);
   let ws, me = {}, seq = 0, push = null, pendingPush = null, myChoice = new Set(), answered = false, closedByUs = false;
+  // auth: mode "pass" (POST rts/v1/join, then /ws?pass=) or "dev" (identity in the URL); identity "demo" or "jwt"
+  let auth = { mode: 'pass', identity: 'demo' }, retries = 0, retryTimer = null, opened = false;
 
   // ---------------------------------------------------------------- helpers
   const show = (id, on = true) => $(id).classList.toggle('hidden', !on);
@@ -186,16 +195,55 @@ Not useful</textarea>
                   set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} } };
   const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
+  // works at "/" (laptop, Docker) and under a path prefix such as "/rts/" (dev ingress)
+  const base = location.pathname.endsWith('/') ? location.pathname : location.pathname.replace(/[^/]*$/, '');
   function wsUrl(params) {
-    // works at "/" (laptop, Docker) and under a path prefix such as "/rts/" (dev ingress)
-    let base = location.pathname.endsWith('/') ? location.pathname : location.pathname.replace(/[^/]*$/, '');
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     return `${proto}//${location.host}${base}ws?${new URLSearchParams(params)}`;
+  }
+  const realToken = () => auth.mode === 'pass' && auth.identity === 'jwt';
+  fetch(base + 'auth-config').then(r => r.json()).then(c => {
+    auth = c;
+    show('tokenBox', realToken()); show('whoBox', !realToken());   // a real token carries the name and role
+  }).catch(() => {});
+
+  /**
+   * Demo only: an unsigned token with the same claims an iGOT token has (sub, name, roles at the configured claim),
+   * so the server reads it exactly like a real one.
+   */
+  function demoToken() {
+    const b64 = o => btoa(unescape(encodeURIComponent(JSON.stringify(o)))).replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+    const claims = { sub: me.userId, name: me.name };
+    const path = (auth.roleClaim || 'realm_access.roles').split('.');
+    let node = claims;
+    path.slice(0, -1).forEach(k => { node = node[k] = node[k] || {}; });
+    node[path[path.length - 1]] = me.role === 'COORDINATOR' && auth.coordinatorRole ? [auth.coordinatorRole] : [];
+    return b64({ alg: 'none', typ: 'JWT' }) + '.' + b64(claims) + '.';
+  }
+
+  /** A single-use join pass (LLD §3.1). Only the code is sent: who you are, your name and role come from the token. */
+  async function newPass() {
+    const token = realToken() ? $('token').value.trim() : demoToken();
+    const r = await fetch(base + 'rts/v1/join', { method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+      body: JSON.stringify({ rtsCode: me.code }) });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) { const e = new Error((body.error && body.error.message) || ('HTTP ' + r.status)); e.status = r.status; throw e; }
+    Object.assign(me, { userId: body.userId, name: body.name, role: body.role });   // as the server read the token
+    return body;
   }
   function send(event, data = {}) {
     if (!ws || ws.readyState !== 1) { toast('Not connected'); return; }
     const f = { event, requestId: 'r' + (++seq), data };
     ws.send(JSON.stringify(f)); log('→', f);
+  }
+  /** Retries after 1, 2, 4, 8, 10, 10 s; then the Reconnect button. */
+  function retryLater(why) {
+    if (retries >= 6) { setStatus('Connection lost', why); show('reconnectBtn'); return; }
+    const delay = Math.min(10, 2 ** retries) * 1000;
+    retries++;
+    setStatus('Connection lost', `${why}. Reconnecting in ${delay / 1000} s…`);
+    retryTimer = setTimeout(connect, delay);
   }
   function setStatus(main, sub = '') { $('status').textContent = main; $('statusSub').textContent = sub; }
 
@@ -203,6 +251,12 @@ Not useful</textarea>
   $('name').value = store.get('rts.name') || '';
   $('joinBtn').onclick = () => {
     const code = $('code').value.trim(), name = $('name').value.trim(), role = $('role').value;
+    if (realToken()) {
+      if (!code || !$('token').value.trim()) { toast('Enter the survey code and paste your access token'); return; }
+      me = { code, name: '', role: '', userId: '' };   // filled in from the token by the join reply
+      connect();
+      return;
+    }
     if (!code || !name) { toast('Enter the survey code and your name'); return; }
     store.set('rts.name', name);
     // the same person keeps the same id on reconnect (so "already answered" works)
@@ -212,20 +266,49 @@ Not useful</textarea>
     me = { code, name, role, userId };
     connect();
   };
-  $('reconnectBtn').onclick = () => connect();
+  $('reconnectBtn').onclick = () => { retries = 0; connect(); };
 
-  function connect() {
-    closedByUs = false;
+  /**
+   * Opens a new socket (a dropped one cannot be reused), each time with a new single-use join pass: the first join
+   * and every reconnect to the same live survey alike.
+   */
+  async function connect() {
+    closedByUs = false; opened = false; clearTimeout(retryTimer);
     show('joinCard', false); show('statusCard'); show('logCard'); show('reconnectBtn', false);
     $('who').textContent = `${me.name} · ${me.role === 'COORDINATOR' ? 'PC' : 'learner'} · ${me.code}`;
-    setStatus('Connecting…');
-    ws = new WebSocket(wsUrl({ rtsCode: me.code, userId: me.userId, role: me.role, name: me.name }));
+    setStatus(retries ? `Reconnecting… (attempt ${retries})` : 'Connecting…');
+    let params;
+    if (auth.mode === 'dev') {
+      params = { rtsCode: me.code, userId: me.userId, role: me.role, name: me.name };
+    } else {
+      try {
+        const p = await newPass();
+        params = { pass: p.pass };
+        $('who').textContent = `${me.name} · ${me.role === 'COORDINATOR' ? 'PC' : 'learner'} · ${me.code}`;
+      } catch (e) {
+        if (e.status === 401 || e.status === 403 || e.status === 404) {   // a retry will not fix these
+          // keep the reason on screen, with the join form to try another code / role
+          setStatus('Cannot join', e.message); show('joinCard'); show('logCard', false); toast('Cannot join: ' + e.message);
+          $('who').textContent = 'not joined';
+          return;
+        }
+        return retryLater('Cannot get a join pass: ' + e.message);
+      }
+    }
+    ws = new WebSocket(wsUrl(params));
+    ws.onopen = () => { opened = true; };
     ws.onmessage = e => { const f = JSON.parse(e.data); log('←', f); handle(f); };
     ws.onclose = e => {
       if (closedByUs) return;
-      setStatus(e.code === 1000 ? 'Disconnected' : 'Connection lost', `close code ${e.code} ${e.reason || ''}`);
-      show('reconnectBtn', e.code !== 4429);
       disableAnswers(true);
+      // 1000: closed on purpose; 4429: survey full. Anything else: retry with a new pass (network, pod gone, or
+      // 4401: the pass was refused)
+      if (e.code === 1000 || e.code === 4429) {
+        setStatus(e.code === 1000 ? 'Disconnected' : 'Survey is full', `close code ${e.code} ${e.reason || ''}`);
+        show('reconnectBtn', e.code !== 4429);
+        return;
+      }
+      retryLater(e.code === 4401 ? 'Join pass refused' : opened ? `Connection lost (close code ${e.code})` : 'Could not connect');
     };
     ws.onerror = () => {};
     const pc = me.role === 'COORDINATOR';
@@ -243,14 +326,25 @@ Not useful</textarea>
     }
     switch (f.event) {
       case 'SESSION_STATE':
+        retries = 0;   // joined: a later drop starts the retries afresh
         $('pod').textContent = 'pod: ' + (d.pod || '-');
         statusFrom(d.status);
         if (me.role === 'COORDINATOR') {
+          // back after a drop: who joined (and is still here) and the current question's text answers so far
           $('sConnected').textContent = d.connected ?? 0;
-          if (d.currentPush) setPcQuestion(d.currentPush);
+          (d.participants || []).forEach(p => person(p.name || p.userId, p.userId, !p.connected));
+          if (d.currentPush) {
+            setPcQuestion(d.currentPush);
+            if (d.currentPush.results) bars('pcBars', d.currentPush.results);
+            (d.currentPush.textAnswers || []).forEach(addText);
+          }
         } else if (d.currentPush && (d.status === 'LIVE' || d.status === 'PAUSED')) {
-          renderQuestion(d.currentPush);
+          // back after a drop: show the question as it is now, with results / answer shown while away
+          const cp = d.currentPush;
+          renderQuestion(cp);
           if (d.myAnswer && d.myAnswer.status === 'RECORDED') { answered = true; answerMsg('Response recorded ✓', 'ok'); disableAnswers(true); }
+          if (cp.results) { show('learnerResults'); bars('learnerBars', cp.results); }
+          if (cp.answerRevealed) markCorrect(cp.correct);
         }
         break;
       case 'SESSION_STARTED': statusFrom('LIVE'); break;
@@ -258,19 +352,22 @@ Not useful</textarea>
       case 'COORDINATOR_BACK': statusFrom('LIVE'); break;
       case 'SESSION_ENDED':
         closedByUs = true;
-        setStatus('Survey ended', ({ENDED_BY_COORDINATOR:'The coordinator ended the survey.', COORDINATOR_LEFT:'The coordinator left.', COORDINATOR_TIMEOUT:'The coordinator did not come back.'})[d.reason] || '');
-        disableAnswers(true); disablePc(true);
+        showEnded(({ENDED_BY_COORDINATOR:'The coordinator ended the survey.', COORDINATOR_LEFT:'The coordinator left.', COORDINATOR_TIMEOUT:'The coordinator did not come back.'})[d.reason] || '');
         break;
       case 'QUESTION_PUSHED': renderQuestion(d); break;
       case 'ANSWERS_STOPPED':
         if (push && d.pushId === push.pushId) {
-          push.answersOpen = false;
-          if (me.role !== 'COORDINATOR' && !answered) answerMsg(d.reason === 'TIMER' ? 'Time is up' : 'Responses closed', 'warn');
-          disableAnswers(true);
+          push.answersOpen = false; push.stopReason = d.reason;
+          if (me.role === 'COORDINATOR') pcRefresh();
+          else { if (!answered) answerMsg(d.reason === 'TIMER' ? 'Time is up' : 'Responses closed', 'warn'); disableAnswers(true); }
         }
         break;
       case 'ANSWERS_RESUMED':
-        if (push && d.pushId === push.pushId) { push.answersOpen = true; if (!answered) { answerMsg('', ''); disableAnswers(false); } }
+        if (push && d.pushId === push.pushId) {
+          push.answersOpen = true; push.resultsShown = false;
+          if (me.role === 'COORDINATOR') pcRefresh();
+          else { show('learnerResults', false); if (!answered) { answerMsg('', ''); disableAnswers(false); } }
+        }
         break;
       case 'SUBMIT_ANSWER_RESULT':
         if (f.status === 'RECORDED') { answered = true; answerMsg('Response recorded ✓', 'ok'); disableAnswers(true); }
@@ -278,13 +375,15 @@ Not useful</textarea>
         break;
       case 'RESULTS_SHOWN':
         if (me.role !== 'COORDINATOR') { show('learnerResults'); bars('learnerBars', d); }
-        else bars('pcBars', d);
+        else { bars('pcBars', d); if (push) { push.resultsShown = true; pcRefresh(); } }
         break;
       case 'ANSWER_REVEALED':
-        (d.correct || []).forEach(i => { const b = document.querySelector(`.opt[data-i="${i}"]`); if (b) b.classList.add('correct'); });
-        if (me.role !== 'COORDINATOR') answerMsg((document.getElementById('answerMsg').textContent || '') + '  ·  Correct answer shown', 'ok');
-        else toast('Correct answer revealed to everyone');
+        if (me.role !== 'COORDINATOR') markCorrect(d.correct);
+        else { toast('Correct answer revealed to everyone'); if (push) { push.answerRevealed = true; pcRefresh(); } }
         break;
+      case 'STOP_ANSWERS_RESULT': if (f.status === 'OK') toast(`Answers stopped (${d.answered} answered)`); break;
+      case 'RESUME_ANSWERS_RESULT': if (f.status === 'OK') toast('Answers open again'); break;
+      case 'SHOW_RESULTS_RESULT': if (f.status === 'OK') toast('Results shown to everyone'); break;
       // ----- coordinator only
       case 'PUSH_QUESTION_RESULT':
         if (pendingPush) { setPcQuestion({ ...pendingPush, pushId: d.pushId, endsAt: d.endsAt }); pendingPush = null; }
@@ -296,15 +395,11 @@ Not useful</textarea>
         $('sConnected').textContent = d.connected; $('sDelivered').textContent = d.delivered; $('sAnswered').textContent = d.answered;
         break;
       case 'LIVE_RESULTS': bars('pcBars', d); break;
-      case 'LIVE_TEXT_ANSWERS':
-        show('textFeedBox');
-        (d.items || []).forEach(it => { const div = document.createElement('div'); div.innerHTML = `<b>${esc(it.name)}</b>: ${esc(it.text)}`; $('textFeed').prepend(div); });
-        break;
+      case 'LIVE_TEXT_ANSWERS': (d.items || []).forEach(addText); break;
       case 'PUSH_DELIVERY':
         $('delivery').textContent = `Question ${d.pushId} reached ${d.delivered} learner(s)` + (d.failed && d.failed.length ? `, failed for ${d.failed.map(x => x.userId).join(', ')}` : '');
         break;
-      case 'END_SESSION_RESULT': case 'STOP_ANSWERS_RESULT': case 'RESUME_ANSWERS_RESULT':
-      case 'SHOW_RESULTS_RESULT': case 'REVEAL_ANSWER_RESULT': case 'START_SESSION_RESULT': break;
+      case 'END_SESSION_RESULT': case 'REVEAL_ANSWER_RESULT': case 'START_SESSION_RESULT': break;
     }
   }
 
@@ -314,8 +409,16 @@ Not useful</textarea>
       WAITING: () => setStatus(pc ? 'Starting…' : 'Waiting for the coordinator', pc ? '' : 'Stay on this page. The survey starts when the coordinator joins.'),
       LIVE: () => setStatus('Survey is live', pc ? 'Push a question below.' : 'Questions appear here when the coordinator pushes them.'),
       PAUSED: () => setStatus('Coordinator reconnecting…', 'Please wait.'),
-      ENDED: () => setStatus('Survey ended', '')
+      ENDED: () => showEnded('')
     }[s] || (() => setStatus(s)))();
+  }
+
+  /** Survey over: only the end message stays on screen, not the last question or the PC controls. */
+  function showEnded(why) {
+    closedByUs = true;
+    disableAnswers(true); disablePc(true);
+    ['learnerCard', 'pcCard', 'composeCard', 'controlCard', 'reconnectBtn'].forEach(id => show(id, false));
+    setStatus('Survey ended', why || 'Thank you for taking part.');
   }
 
   // ---------------------------------------------------------------- learner
@@ -344,6 +447,7 @@ Not useful</textarea>
       $('qFreeInput').placeholder = q.type === 'WORD_CLOUD' ? '1 to 3 words, separated by commas' : 'Your answer';
     }
     disableAnswers(q.answersOpen === false);
+    if (q.answersOpen === false) answerMsg('Responses closed', 'warn');
     if (me.role === 'COORDINATOR') setPcQuestion(q);
   }
   $('multiSend').onclick = () => push && send('SUBMIT_ANSWER', { pushId: push.pushId, choice: [...myChoice] });
@@ -355,6 +459,10 @@ Not useful</textarea>
   };
   function disableAnswers(off) {
     document.querySelectorAll('#qOpts button, #qFreeSend, #multiSend, #qFreeInput').forEach(b => b.disabled = off);
+  }
+  function markCorrect(correct) {
+    (correct || []).forEach(i => { const b = document.querySelector(`.opt[data-i="${i}"]`); if (b) b.classList.add('correct'); });
+    answerMsg((document.getElementById('answerMsg').textContent || '') + '  ·  Correct answer shown', 'ok');
   }
   function answerMsg(t, cls) { const m = $('answerMsg'); m.textContent = t; m.className = 'msg ' + cls; }
 
@@ -386,13 +494,34 @@ Not useful</textarea>
     if (pod) el.dataset.pod = pod;
     el.classList.toggle('left', left);
   }
+  function addText(it) {
+    show('textFeedBox');
+    const div = document.createElement('div'); div.innerHTML = `<b>${esc(it.name)}</b>: ${esc(it.text)}`; $('textFeed').prepend(div);
+  }
   function setPcQuestion(q) {
-    push = Object.assign({}, push, q);
+    // same question again (e.g. after a reconnect): keep what we knew; a new question starts clean
+    push = Object.assign({}, push && push.pushId === q.pushId ? push : {}, q);
+    if (push.answersOpen === undefined) push.answersOpen = true;   // just pushed
     $('pcQText').textContent = `${q.pushId}: ${q.text}`;
     $('sDelivered').textContent = '-'; $('sAnswered').textContent = '0';
     $('pcBars').innerHTML = '<span class="muted">No answers yet</span>';
     $('textFeed').innerHTML = ''; show('textFeedBox', q.type === 'TEXT');
-    $('revealBtn').disabled = !(q.correct && q.correct.length);
+    pcRefresh();
+  }
+  /** The PC's view of the current question: what learners see now, and which controls make sense. */
+  function pcRefresh() {
+    if (!push || !push.pushId) return;
+    const graded = !!(push.correct && push.correct.length);
+    const state = [push.answersOpen ? 'Answers open'
+        : ({ TIMER: 'Answers stopped: time is up', NEXT_QUESTION: 'Answers stopped' })[push.stopReason] || 'Answers stopped'];
+    if (push.resultsShown) state.push('results shown to learners');
+    if (push.answerRevealed) state.push('correct answer revealed');
+    $('pcQState').textContent = state.join(' · ');
+    $('pcQState').className = 'msg ' + (push.answersOpen ? 'ok' : 'warn');
+    $('stopBtn').disabled = !push.answersOpen;
+    $('resumeBtn').disabled = push.answersOpen;
+    $('showBtn').textContent = push.resultsShown ? 'Show results again' : 'Show results';
+    $('revealBtn').disabled = !graded || !!push.answerRevealed;
   }
   $('qType').onchange = () => show('optsBlock', ['SINGLE', 'MULTI'].includes($('qType').value));
   $('pushBtn').onclick = () => {

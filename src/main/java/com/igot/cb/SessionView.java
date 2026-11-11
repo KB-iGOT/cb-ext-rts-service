@@ -5,7 +5,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * State of one survey as read from the {@link SessionStore} (memory or Redis), keyed by RTS code. Immutable
+ * State of one survey as read from the {@link SessionStore} (Redis), keyed by RTS code. Immutable
  * snapshots: the store is the truth; pods only hold sockets.
  */
 public record SessionView(String code, String roomId, Status status, String coordinatorId, long pausedAt,
@@ -69,5 +69,17 @@ public record SessionView(String code, String roomId, Status status, String coor
     }
 
     public record Delivery(long delivered, List<String> failedUserIds) {
+    }
+
+    /** After a learner socket closed: distinct learners connected, and whether this learner still has a socket. */
+    public record Left(long connected, boolean stillConnected) {
+    }
+
+    /** A learner who has joined the survey (for the PC's list): connected now or not. */
+    public record Participant(String userId, String name, boolean connected) {
+    }
+
+    /** A free-text answer to the current question, as the PC sees it live (LIVE_TEXT_ANSWERS). */
+    public record TextAnswer(String userId, String name, String text) {
     }
 }

@@ -2,6 +2,7 @@ package com.igot.cb;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,27 +19,34 @@ import reactor.core.publisher.Mono;
  * One call per socket: read who it is from the URL, join the survey, process frames in order, clean up.
  * Any pod can serve any socket: the survey state is in the {@link SessionStore}.
  *
- * <p>URL (dev identity, no auth — this service measures capacity):
- * {@code /ws?rtsCode=482913&userId=asha&role=PARTICIPANT|COORDINATOR&name=Asha}.
- * The old {@code ?room=&clientId=&role=trainer|learner} form still works for scripts/poc_test.py and
- * scripts/pod_load_test.py. In production the identity comes from a signed join pass instead (LLD §3).
+ * <p>rts.auth.mode=pass (default, LLD §3.2): {@code /ws?pass=...}; who the socket is (user, name, survey, role) comes
+ * only from the join pass, used up here. A missing, used or expired pass: ERROR UNAUTHORIZED, then close 4401, so
+ * the client knows to ask POST /rts/v1/join for a new one.
+ *
+ * <p>rts.auth.mode=dev (local and load tests only, no checks):
+ * {@code /ws?rtsCode=482913&userId=asha&role=PARTICIPANT&name=Asha}.
+ * The old {@code ?room=&clientId=&role=trainer|learner} form still works there for scripts/poc_test.py and
+ * scripts/pod_load_test.py.
  */
 @Component
 public class RtsWebSocketHandler implements WebSocketHandler {
 
     private static final Logger log = LoggerFactory.getLogger(RtsWebSocketHandler.class);
     static final CloseStatus LIMIT = new CloseStatus(4429, "PARTICIPANT_LIMIT_REACHED");
+    static final CloseStatus UNAUTHORIZED = new CloseStatus(4401, "UNAUTHORIZED");
     private static final CloseStatus TRY_AGAIN = new CloseStatus(1011, "TRY_AGAIN");
 
     private final SessionManager manager;
     private final Stats stats;
     private final Frames frames;
     private final RtsSettings.Ws ws;
+    private final JoinPasses passes;
     private final String pod;
 
     public RtsWebSocketHandler(SessionManager manager, Stats stats, Frames frames, RtsSettings settings,
-            @Value("${pod.name}") String pod) {
+            JoinPasses passes, @Value("${pod.name}") String pod) {
         this.manager = manager;
+        this.passes = passes;
         this.stats = stats;
         this.frames = frames;
         this.ws = settings.ws();
@@ -52,12 +60,45 @@ public class RtsWebSocketHandler implements WebSocketHandler {
         Map<String, String> q = new java.util.HashMap<>();
         UriComponentsBuilder.fromUri(session.getHandshakeInfo().getUri()).build().getQueryParams().toSingleValueMap()
                 .forEach((k, v) -> q.put(k, v == null ? null : java.net.URLDecoder.decode(v, StandardCharsets.UTF_8)));
-        boolean legacy = !q.containsKey("rtsCode") && q.containsKey("room");
-        String code = legacy ? q.get("room") : q.get("rtsCode");
-        String userId = q.getOrDefault("userId", q.getOrDefault("clientId", "unknown"));
-        String role = q.getOrDefault("role", "PARTICIPANT");
+        if (!passes.enabled()) {
+            return handle(session, q, null);
+        }
+        return passes.take(q.get("pass"))
+                .map(p -> Optional.of(p)).defaultIfEmpty(Optional.empty())
+                .onErrorResume(e -> {
+                    log.warn("Join pass check failed: {}", e.toString());
+                    return Mono.just(Optional.empty());
+                })
+                .flatMap(p -> p.isPresent() ? handle(session, q, p.get()) : refuse(session));
+    }
+
+    /** LLD §3.2: a missing, used or expired pass gets ERROR UNAUTHORIZED, then close 4401 (ask for a new pass). */
+    private Mono<Void> refuse(WebSocketSession session) {
+        stats.rejected.increment();
+        log.info("WebSocket refused: no valid join pass, from {}", session.getHandshakeInfo().getRemoteAddress());
+        return session.send(Mono.just(session.textMessage(new String(
+                        frames.error(null, "UNAUTHORIZED", "Join pass missing, invalid, expired or already used")))))
+                .then(session.close(UNAUTHORIZED));
+    }
+
+    private Mono<Void> handle(WebSocketSession session, Map<String, String> q, AuthStore.Pass pass) {
+        boolean legacy = pass == null && !q.containsKey("rtsCode") && q.containsKey("room");
+        String code;
+        String userId;
+        String role;
+        String name;
+        if (pass != null) {
+            code = pass.code();
+            userId = pass.userId();
+            role = pass.role();
+            name = pass.name();
+        } else {
+            code = legacy ? q.get("room") : q.get("rtsCode");
+            userId = q.getOrDefault("userId", q.getOrDefault("clientId", "unknown"));
+            role = q.getOrDefault("role", "PARTICIPANT");
+            name = q.getOrDefault("name", userId);
+        }
         boolean coordinator = role.equalsIgnoreCase("COORDINATOR") || role.equalsIgnoreCase("trainer");
-        String name = q.getOrDefault("name", userId);
         if (code == null || code.isBlank()) {
             stats.rejected.increment();
             return session.send(Mono.just(session.textMessage(

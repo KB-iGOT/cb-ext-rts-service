@@ -45,11 +45,13 @@ public class SessionManager {
 
     private final SessionStore store;
     private final SessionBus bus;
+    private final PodPresence presence;
     private final Frames frames;
     private final ObjectMapper mapper;
     private final Stats stats;
     private final RtsSettings.Room room;
     private final RtsSettings.Ws ws;
+    private final RtsSettings.Pod podSettings;
     /** This pod's name: every socket held here is on this pod (shown to clients and in logs). */
     private final String pod;
     private final Scheduler timers = Schedulers.newParallel("rts-timer", 2, true);
@@ -65,15 +67,17 @@ public class SessionManager {
     private record CachedPush(String pushId, Question question) {
     }
 
-    public SessionManager(SessionStore store, SessionBus bus, Frames frames, ObjectMapper mapper, Stats stats,
-            RtsSettings settings, @Value("${pod.name}") String pod) {
+    public SessionManager(SessionStore store, SessionBus bus, PodPresence presence, Frames frames,
+            ObjectMapper mapper, Stats stats, RtsSettings settings, @Value("${pod.name}") String pod) {
         this.store = store;
         this.bus = bus;
+        this.presence = presence;
         this.frames = frames;
         this.mapper = mapper;
         this.stats = stats;
         this.room = settings.room();
         this.ws = settings.ws();
+        this.podSettings = settings.pod();
         this.pod = pod;
         bus.onEvent(this::deliver);
         stats.sessionSummary(this::summary);
@@ -81,6 +85,9 @@ public class SessionManager {
         loops.add(timers.schedulePeriodically(this::liveStatsTick, live, live, TimeUnit.MILLISECONDS));
         long ping = ws.pingInterval().toMillis();
         loops.add(timers.schedulePeriodically(this::pingSweep, ping, ping, TimeUnit.MILLISECONDS));
+        presenceSweep();
+        long beat = podSettings.heartbeat().toMillis();
+        loops.add(timers.schedulePeriodically(this::presenceSweep, beat, beat, TimeUnit.MILLISECONDS));
         log.info("Session store: {} (pod {})", store.getClass().getSimpleName(), pod);
     }
 
@@ -111,12 +118,13 @@ public class SessionManager {
 
     /** Counts the socket in the survey (false = refused, participant limit) and subscribes this pod to it. */
     Mono<Boolean> join(Conn c) {
+        // recorded before it is counted, so if this pod crashes right after, another pod still counts it out
         Mono<Boolean> admit = c.legacy ? Mono.just(true)
-                : c.coordinator ? store.pcJoin(c.code, c.connId).thenReturn(true)
-                : store.join(c.code, c.userId, room.maxParticipants()).map(n -> n >= 0);
+                : presence.add(c).then(c.coordinator ? store.pcJoin(c.code, c.connId).thenReturn(true)
+                        : store.join(c.code, c.userId, c.name, room.maxParticipants()).map(n -> n >= 0));
         return admit.flatMap(ok -> {
             if (!ok) {
-                return Mono.just(false);
+                return presence.remove(c).thenReturn(false);
             }
             c.joined = true;
             local.computeIfAbsent(c.code, k -> ConcurrentHashMap.newKeySet()).add(c);
@@ -141,10 +149,11 @@ public class SessionManager {
                             .map(s -> new Step(s.view(), s.created() ? "SESSION_STARTED" : null));
                 }
                 return Mono.just(new Step(v, null));
-            }).flatMap(step -> store.connected(code).flatMap(n -> {
+            }).flatMap(step -> Mono.zip(store.connected(code), snapshot(c, step.view())).flatMap(t -> {
                 SessionView v = step.view();
+                long n = t.getT1();
                 statusCache.put(code, v.status());
-                c.send(state(c, v, n, null));
+                c.send(state(c, v, n, null, t.getT2()));
                 if ("SESSION_STARTED".equals(step.event())) {
                     log.info("Survey {} started as room {} when PC {} joined", code, v.roomId(), c.userId);
                     return publish(code, "SESSION_STARTED", PARTICIPANTS, v.roomId(), map("roomId", v.roomId()));
@@ -162,8 +171,9 @@ public class SessionManager {
             statusCache.put(code, v.status());
             PushView p = v.running() ? v.current() : null;
             Mono<Boolean> answered = p == null ? Mono.just(false) : store.hasAnswered(code, p.pushId(), c.userId);
-            return answered.flatMap(a -> {
-                c.send(state(c, v, n, a ? "RECORDED" : null));
+            return Mono.zip(answered, snapshot(c, v)).flatMap(ar -> {
+                boolean a = ar.getT1();
+                c.send(state(c, v, n, a ? "RECORDED" : null, ar.getT2()));
                 return v.running() ? publish(code, "PARTICIPANT_JOINED", COORDINATORS, v.roomId(),
                         map("userId", c.userId, "name", c.name, "pod", pod, "connected", n)) : Mono.<Void>empty();
             });
@@ -173,50 +183,101 @@ public class SessionManager {
     private record Step(SessionView view, String event) {
     }
 
-    private byte[] state(Conn c, SessionView v, long connected, String myAnswer) {
+    /**
+     * What SESSION_STATE needs besides the survey view. results: of the current question once shown (else empty).
+     * participants, texts: PC only (else empty): everyone who joined with whether they are connected, and the
+     * free-text answers to the current question, which otherwise reach the PC only as live events.
+     */
+    private record Snapshot(Map<String, Object> results, List<SessionView.Participant> participants,
+            List<SessionView.TextAnswer> texts) {
+    }
+
+    private Mono<Snapshot> snapshot(Conn c, SessionView v) {
         PushView p = v.running() ? v.current() : null;
+        Mono<Map<String, Object>> results = p != null && p.shown() ? store.results(c.code, p) : Mono.just(Map.of());
+        Mono<List<SessionView.Participant>> participants = c.coordinator ? store.participants(c.code)
+                : Mono.just(List.of());
+        Mono<List<SessionView.TextAnswer>> texts = c.coordinator && p != null && "TEXT".equals(p.question().type())
+                ? store.textAnswers(c.code, p.pushId()) : Mono.just(List.of());
+        return Mono.zip(results, participants, texts).map(t -> new Snapshot(t.getT1(), t.getT2(), t.getT3()));
+    }
+
+    /**
+     * SESSION_STATE: everything a (re)connecting socket needs to carry on from where the survey is now; the events
+     * it missed are not replayed, and nothing about earlier questions is sent. For the current question: the
+     * results and (learners) the correct answer if the PC showed / revealed them meanwhile, and (PC) the free-text
+     * answers so far. PC: also the list of learners who joined, connected or not.
+     */
+    private byte[] state(Conn c, SessionView v, long connected, String myAnswer, Snapshot s) {
+        Map<String, Object> results = s.results();
+        PushView p = v.running() ? v.current() : null;
+        Map<String, Object> current = null;
+        if (p != null) {
+            current = c.coordinator ? p.forCoordinator() : p.forLearners();
+            if (!c.coordinator) {
+                current.put("resultsShown", p.shown());
+                current.put("answerRevealed", p.revealed());
+                if (p.revealed()) {
+                    current.put("correct", p.question().correct());
+                }
+            }
+            if (p.shown() && !results.isEmpty()) {
+                current.put("results", results);
+            }
+            if (c.coordinator && "TEXT".equals(p.question().type())) {
+                current.put("textAnswers", s.texts());
+            }
+        }
         return frames.event("SESSION_STATE", v.roomId(), map("status", v.status(),
                 "role", c.coordinator ? "COORDINATOR" : "PARTICIPANT", "roomId", v.roomId(), "pod", pod,
                 "connected", connected,
-                "currentPush", p == null ? null : c.coordinator ? p.forCoordinator() : p.forLearners(),
+                "participants", c.coordinator ? s.participants() : null,
+                "currentPush", current,
                 "myAnswer", myAnswer == null ? null : map("status", myAnswer)));
     }
 
     /** The socket closed. A PC that drops (no LEAVE/END) pauses the survey when no other PC socket is left. */
     Mono<Void> onLeft(Conn c, String reason) {
-        boolean lastHere = removeLocal(c);
+        removeLocal(c);
         if (!c.joined || c.legacy) {
             return Mono.empty();
         }
         String code = c.code;
         bus.unsubscribe(code);
-        Mono<Void> work;
-        if (c.coordinator) {
-            work = store.pcLeave(code, c.connId).flatMap(remaining -> {
-                if (remaining > 0 || c.explicitLeave || c.ended) {
+        boolean expected = c.explicitLeave || c.ended;
+        // false: this pod was taken for dead and another pod already counted this socket out
+        return presence.remove(c)
+                .flatMap(owned -> owned ? left(code, c.connId, c.userId, c.name, c.coordinator, reason, expected)
+                        : Mono.<Void>empty());
+    }
+
+    /**
+     * Counts one socket out of its survey, on its own pod or for a crashed pod. expected: LEAVE / END / survey over,
+     * so nobody is told. PC: the survey pauses when it was the last PC socket. Learner: the PC is told, unless the
+     * learner still has another socket (second tab, or already reconnected on another pod).
+     */
+    private Mono<Void> left(String code, String connId, String userId, String name, boolean coordinator,
+            String reason, boolean expected) {
+        if (coordinator) {
+            return store.pcLeave(code, connId).flatMap(remaining -> {
+                if (remaining > 0 || expected) {
                     return Mono.<Void>empty();
                 }
                 long now = System.currentTimeMillis();
                 return store.pause(code, now).flatMap(v -> {
-                    log.info("Coordinator {} lost in {}; survey paused", c.userId, code);
+                    log.info("Coordinator {} lost in {}; survey paused", userId, code);
                     statusCache.put(code, Status.PAUSED);
                     schedulePcTimeout(code, now);
                     long waitSec = room.pcWaitTimeout().toSeconds();
-                    return publish(code, "COORDINATOR_AWAY", PARTICIPANTS, v.roomId(),
-                            map("waitSec", waitSec > 0 ? waitSec : null));
+                    return presence.paused(code, now).then(publish(code, "COORDINATOR_AWAY", PARTICIPANTS,
+                            v.roomId(), map("waitSec", waitSec > 0 ? waitSec : null)));
                 });
             });
-        } else {
-            work = store.leave(code, c.userId).flatMap(n -> c.ended ? Mono.<Void>empty()
-                    : store.view(code).filter(SessionView::running).flatMap(v -> publish(code, "PARTICIPANT_LEFT",
-                            COORDINATORS, v.roomId(), map("userId", c.userId, "name", c.name, "reason", reason,
-                                    "connected", n))));
         }
-        return work.then(Mono.fromRunnable(() -> {
-            if (lastHere) {
-                store.forget(code);
-            }
-        }));
+        return store.leave(code, userId).flatMap(l -> expected || l.stillConnected() ? Mono.<Void>empty()
+                : store.view(code).filter(SessionView::running).flatMap(v -> publish(code, "PARTICIPANT_LEFT",
+                        COORDINATORS, v.roomId(), map("userId", userId, "name", name, "reason", reason,
+                                "connected", l.connected()))));
     }
 
     /** True when it was this pod's last socket of the survey. */
@@ -474,7 +535,8 @@ public class SessionManager {
             if (!validAnswer(q, data, choice, words)) {
                 return reply(c, requestId, pushId, "INVALID_ANSWER");
             }
-            return store.submit(c.code, pushId, c.userId, choice, words, System.currentTimeMillis())
+            String text = "TEXT".equals(q.type()) ? data.path("text").asText() : null;
+            return store.submit(c.code, pushId, c.userId, c.name, choice, words, text, System.currentTimeMillis())
                     .flatMap(outcome -> {
                         Mono<Void> r = reply(c, requestId, pushId, outcome);
                         if ("RECORDED".equals(outcome) && "TEXT".equals(q.type())) {
@@ -687,6 +749,42 @@ public class SessionManager {
                 }
             }
         }
+    }
+
+    /**
+     * Every heartbeat: tell Redis this pod is alive; count out the sockets of pods that stopped heartbeating (they
+     * crashed: nobody ran their leave); end paused surveys whose PC wait ran out (the pod holding that timer may be
+     * gone). Each piece of work is claimed in Redis, so with several pods sweeping it is done once.
+     */
+    private void presenceSweep() {
+        long now = System.currentTimeMillis();
+        presence.heartbeat().flatMap(reaped -> {
+            if (reaped) {
+                // this pod stalled long enough to be taken for dead; its sockets were counted out, so drop them
+                // and let the clients reconnect and be counted again
+                log.warn("This pod was taken for dead (no heartbeat for {}); closing its sockets",
+                        podSettings.deadAfter());
+                closeAll();
+            }
+            return presence.claimDeadPods(now - podSettings.deadAfter().toMillis())
+                    .concatMap(o -> left(o.code(), o.connId(), o.userId(), o.name(), o.coordinator(),
+                            "CONNECTION_LOST", false)
+                            .onErrorResume(e -> {
+                                log.warn("Clean-up of {} in {} failed: {}", o.userId(), o.code(), e.toString());
+                                return Mono.empty();
+                            }))
+                    .then();
+        }).then(Mono.defer(() -> {
+            long wait = room.pcWaitTimeout().toMillis();
+            if (wait <= 0) {
+                return Mono.<Void>empty();
+            }
+            return presence.takePausedBefore(now - wait)
+                    .concatMap(t -> store.view(t.getT1())
+                            .filter(v -> v.status() == Status.PAUSED && v.pausedAt() == t.getT2())
+                            .flatMap(v -> end(t.getT1(), "COORDINATOR_TIMEOUT")))
+                    .then();
+        })).subscribe(null, e -> log.warn("Presence sweep failed: {}", e.toString()));
     }
 
     /** Surveys with sockets on this pod, by last known status (for /stats). */
