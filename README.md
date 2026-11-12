@@ -3,9 +3,9 @@
 A Real Time Survey (RTS) lets a Program Coordinator ask learners in a classroom session a few quick questions and see
 their answers as they come in. The coordinator controls questions, answer timing, and results.
 
-Real Time Survey (RTS) WebSocket server that keeps **everything in one pod's memory (no Redis)**. Its job is to
-measure how many sockets and how much survey traffic **one pod** can carry, so the technology and the pod size can
-be decided. It speaks the protocol of the HLD (§9). The client-side load generator is in `loadgen/`.
+Real Time Survey (RTS) WebSocket server. Survey state lives in **Redis**, shared by every pod, so any pod serves
+any PC or learner and a pod restart does not lose a survey. Redis is required: there is no in-memory mode.
+It speaks the protocol of the HLD (§9). The client-side load generator is in `loadgen/`.
 Java 17 · Spring Boot 3.4 · WebFlux on Reactor Netty.
 
 ## What it does
@@ -25,16 +25,50 @@ Java 17 · Spring Boot 3.4 · WebFlux on Reactor Netty.
 | Limits | 200 participants per survey (close 4429); slow reader dropped after 256 queued frames (close 1008); no frame for 50 s → closed as lost; pings every 20 s |
 | Pod shutdown | every socket closed with 1001 so clients reconnect |
 
-Identity comes from the URL (no auth, this is a capacity tool):
-`ws://host:8080/ws?rtsCode=482913&userId=asha&role=PARTICIPANT|COORDINATOR&name=Asha`.
-The old `?room=&clientId=&role=trainer|learner` form still works for `scripts/poc_test.py` and
-`scripts/pod_load_test.py` (plain `QUESTION` relay + a `{"type":"CONNECTED","pod":...}` hello).
+## Who is connecting: join passes (LLD §3)
+
+The role is never taken from the client. `rts.auth.mode=pass` (default):
+
+1. `POST /rts/v1/join {rtsCode}` with `Authorization: Bearer <Keycloak access token>`. Only the code is sent:
+   **userId, name and role come from the token** (RS256, realm public key `RTS_AUTH_JWT_PUBLIC_KEY` or JWKS URL
+   `RTS_AUTH_JWT_JWKS_URI`, issuer `RTS_AUTH_JWT_ISSUER`). userId = `sub` after the last `:`; name = `name`, else
+   `preferred_username`; role = COORDINATOR if the roles at `RTS_AUTH_JWT_ROLE_CLAIM` (default
+   `realm_access.roles`) include one of `RTS_AUTH_JWT_COORDINATOR_ROLES` (default `PROGRAM_COORDINATOR`; confirm
+   both against a real iGOT token), else PARTICIPANT. Then the survey's roster: a coordinator is PC only of their
+   own survey (in another PC's survey they join as a learner, if allowed); a participant must be one of its
+   learners. Reply `{pass, path, expiresAt, userId, name, role}`; errors 400 `BAD_REQUEST`, 401 `UNAUTHENTICATED`,
+   403 `NOT_ENROLLED`, 404 `RTS_NOT_ENABLED`.
+2. `wss://host/ws?pass=...`. The pass is used up when the socket opens (Redis `GETDEL`, any pod); a missing, used or
+   expired pass gets `ERROR UNAUTHORIZED`, then close **4401**, so the app asks for a new pass. Identity, survey and
+   role come only from the pass.
+3. Every connection uses a new pass: a reconnect to the same live survey is step 1 again, and the server matches it
+   to the same person by user id (same answers, current state; no new session).
+
+Rosters stand in for the service that owns RTS sessions (PC of the session, learners of its batch):
+`PUT /admin/sessions/{code}` with `X-Admin-Key: $RTS_AUTH_ADMIN_KEY` and
+`{"coordinators": ["u1"], "participants": ["u2", "u3"], "anyLearner": false}`. Demo settings (docker compose):
+`RTS_AUTH_IDENTITY=demo` takes an unsigned token (alg `none`) with the same claims, read the same way but not
+checked (the demo page builds it from the name and role you pick), and `RTS_AUTH_DEV_CLAIM_COORDINATOR=true`
+makes the first person asking to be PC of an unknown code its PC. `RTS_AUTH_ALLOWED_ORIGINS` limits which web
+origins may open a socket.
+
+`rts.auth.mode=dev` (`RTS_AUTH_MODE=dev`) is for local and load tests only: identity from the URL with no checks,
+`ws://host:8080/ws?rtsCode=482913&userId=asha&role=PARTICIPANT|COORDINATOR&name=Asha`. The load generator,
+`scripts/capacity_ramp.py`, `scripts/k6-rts-load.js` and the old `?room=&clientId=&role=trainer|learner` form
+(`scripts/poc_test.py`, `scripts/pod_load_test.py`) need it.
+
+## Try it with friends
+
+`docker compose up --build -d`, then open `http://<your-ip>:8000` (nginx spreading people over two pods; `:8080`/`:8081` are the pods directly): a page to join as the coordinator or a learner.
+Step-by-step test with 10+ people (browser or terminal, laptop or dev): [docs/TESTING-WITH-FRIENDS.md](docs/TESTING-WITH-FRIENDS.md).
 
 ## Build, test, run
 
 ```bash
-mvn clean package                      # runs SurveyFlowTest (whole survey over real sockets)
-POD_NAME=local-1 PORT=8081 java -jar target/cb-ext-rts-service.jar
+docker run -d -p 6379:6379 redis:7       # tests and the service need Redis
+mvn clean package                      # runs the tests (whole survey over real sockets, on Redis)
+RTS_AUTH_IDENTITY=demo RTS_AUTH_DEV_CLAIM_COORDINATOR=true POD_NAME=local-1 PORT=8081 \
+    java -jar target/cb-ext-rts-service.jar   # Redis on localhost:6379, demo auth
 ```
 
 `POD_NAME` is only a label for logs and `/stats` (default `local-1`). In Kubernetes it is set from the pod name.
@@ -54,7 +88,7 @@ Load comes from the client-side load generator in [`loadgen/`](loadgen/README.md
 ```bash
 mvn -f loadgen/pom.xml package
 # terminal 1: pod-sized server (1 core, 1.5 GB heap)
-POD_NAME=pod-1cpu PORT=8080 taskset -c 0 java -Xmx1500m -jar target/cb-ext-rts-service.jar
+RTS_AUTH_MODE=dev POD_NAME=pod-1cpu PORT=8080 taskset -c 0 java -Xmx1500m -jar target/cb-ext-rts-service.jar
 # terminal 2: load generator (separate JVM)
 java -Xmx6g -jar loadgen/target/cb-ext-rts-loadgen.jar
 # terminal 3: ramp (reads the pod's /stats through the load generator)
@@ -88,13 +122,75 @@ Memory, not CPU, is the limit: about 17–20 KB per socket, so heap size decides
 
 `k8s/cb-ext-rts-service.yaml` is a plain manifest for the service itself (1 replica, requests = limits =
 1 CPU / 2 Gi, `POD_NAME` from the pod name) if it is not deployed through the igot-deploy chart.
+
+## Where the survey state lives: Redis
+
+All survey state, join passes, rosters and pod heartbeats are in Redis, shared by all pods: any pod serves any PC
+or learner, and a pod restart or crash does not lose a survey (clients reconnect to any pod and continue).
+
+Set `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD` (else `IGOT_REDIS_HOST`/`IGOT_REDIS_PORT` from the shared iGOT
+ConfigMap, else localhost:6379). The pod does not start if Redis is unreachable (log: "Unable to connect to Redis");
+if Redis drops while running, joins and answers reply `TRY_AGAIN`. Layout (LLD §4), keys carry the hash tag `{code}`:
+
+| Key | Type | Holds |
+|---|---|---|
+| `rts:{code}:room` | hash | roomId, status, coordinatorId, pausedAt, pushCount, current question (snapshot), open, endsAt, shown, revealed |
+| `rts:{code}:names` | hash | learner userId → name, everyone who joined (the PC's list after a reconnect) |
+| `rts:{code}:conn` | hash | learner userId → open sockets; the 200 cap counts its fields (one atomic script). LLD K5 is a set; a hash also tells one tab from two |
+| `rts:{code}:pcs` | set | PC socket ids; the survey pauses only when the last one drops |
+| `rts:{code}:{pushId}:ans / cnt / words / texts` | set / hash / zset / list | who answered; total + count per option; word-cloud counts; free-text answers (userId, name, text) |
+| `rts:{code}:{pushId}:dlv / dlvf` | hash / set | sockets the question was written to (summed over pods); who it failed for |
+| `rts:pass:{id}` | string | join pass (userId, name, code, role); expires after 60 s; removed on use |
+| `rts:{code}:roster` | hash | coordinators, participants (`*` = anyone) |
+| channel `rts:room:{code}` | pub/sub | every survey event; each pod with sockets of the survey writes it to them |
+| `rts:pods` | zset | pod instance (name + random suffix) → last heartbeat |
+| `rts:pod:{podId}:conns` | hash | socket id → code, userId, name, role of each socket on that pod |
+| `rts:paused` | zset | survey code → pausedAt, while PAUSED |
+
+Every check-then-change is one Lua script (start, pause/resume, end, push, stop/resume, timer, mark, submit,
+join, leave). Keys expire 12 h after start and 1 h after the survey ends.
+
+Measured on a laptop (28 Oct 2026), 2 pods + 1 Redis, 30 surveys × 200 with every survey split over both pods:
+6,000/6,000 sockets, every question to every learner, every answer recorded, push p95 3 ms, Redis ≈ 5,500
+ops/s (about one Redis operation per learner per second; scale this to size Redis). `kill -9` of the pod holding
+the PC mid-question: the PC and learners reconnected to the other pod and found the same question, still LIVE,
+with the answers given on the dead pod kept.
+
+A pod that crashes runs no "left" step for its sockets, so every pod heartbeats (`rts.pod.heartbeat`, 5 s) and
+records its sockets in Redis. A pod silent for `rts.pod.dead-after` (20 s) is claimed by one other pod, which counts
+its sockets out: the PC gets `PARTICIPANT_LEFT {reason: CONNECTION_LOST}`, and if it held the last PC socket the
+survey pauses (`COORDINATOR_AWAY`). A learner who already reconnected elsewhere is not reported as left (the same
+holds for closing one of two tabs). The same sweep ends paused surveys whose PC wait ran out, so that no longer
+depends on the pod that paused them. A pod that stalls past dead-after and comes back finds it was taken for dead
+and closes its sockets so the clients reconnect and are counted again. Keep dead-after the same on every pod.
+
+While the survey runs, anyone can come back and carries on from where the survey is now. A client that reconnects
+gets everything in `SESSION_STATE`; events it missed are not replayed and nothing about earlier questions is sent:
+the current question, its own answer, and, if the PC showed them meanwhile, the results and (learners) the correct
+answer. A PC also gets `participants` (everyone who joined, `connected` or not) and, for a free-text question, its
+`textAnswers` so far (kept in `rts:{code}:{pushId}:texts`), which otherwise reach the PC only as live events.
+
+Tests: `SurveyFlowTest`, `PcJoinTest`, `JoinPassTest` and `DevClaimTest` run the flows on Redis;
+`RedisTwoPodsTest` runs a survey across two pods and loses one mid-survey; `RedisPodCrashTest` leaves a crashed
+pod behind in Redis and checks the clean-up. All of them except
+`JwtIdentityVerifierTest` need Redis on localhost:6379 and are skipped without it, so the Jenkins build does not
+need Redis (run them locally before pushing).
+
 ## Files
 
 | File | Role |
 |---|---|
 | `RtsWebSocketHandler` | one call per socket: read identity, join, frames in order, clean up |
-| `SessionManager` | the protocol: state changes under the survey's lock, sends after; timers, live stats, ping sweep |
-| `Session`, `Conn` | survey state (status, current question, answers); one socket with its bounded send queue |
+| `SessionManager` | the protocol: change the state in the store, then announce it on the bus; timers, live stats, ping sweep |
+| `SessionStore`: `RedisSessionStore` | survey state in Redis, changed with Lua scripts |
+| `SessionBus`: `RedisSessionBus` | survey events to every pod with sockets of the survey |
+| `JoinController`, `JoinPasses` | POST /rts/v1/join and rosters; the pass is checked and used up when the socket opens (`RtsWebSocketHandler`, close 4401 if not valid) |
+| `OriginFilter` | refuses sockets from web origins not in `rts.auth.allowed-origins` |
+| `IdentityVerifier`: `JwtIdentityVerifier`, `DemoIdentityVerifier` | who is calling POST /rts/v1/join (Keycloak token, or demo) |
+| `AuthStore`: `RedisAuthStore` | join passes and rosters |
+| `PodPresence`: `RedisPodPresence` | pod heartbeat and socket records, so a crashed pod's sockets are counted out |
+| `SessionView`, `Results`, `RtsError` | state snapshots, result bodies, request errors |
+| `Conn` | one socket on this pod with its bounded send queue |
 | `Frames` | JSON envelope, serialised once per broadcast |
 | `Stats`, `StatsController` | capacity numbers |
 | `ShutdownCloser` | closes sockets with 1001 on shutdown |
